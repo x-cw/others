@@ -1,0 +1,2123 @@
+
+Author: liusm & zhujt & luoml
+
+
+
+
+
+
+
+
+
+
+
+L2 Bank Design Specification
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+Version No.1.6
+Data: 5/20/2025
+
+
+?
+Revision History
+Date	Revision	Author	Description
+2024.12.26	V1.0	liusm	Pass the review
+2025.2.5	V1.1	liusm	Add description of lookup pipeline and touch mask.
+2025.2.26	V1.2	zhujt	Update atomic special value result
+2025.3.11	V1.3	zhujt	RCTRL implement update
+2025.3.14	V1.3	liusm	Add isched-rctrl wdata interface to improve performance
+2025.3.25	V1.4	luoml	Adjust the bank group from 4 bank to 2bank and the memory scheduler¡¯s description
+2025.4.11	V1.5	zhujt	add FP32 atomic CAS. FP32 min/max special value update
+2025.5.20	V1.6	Liusm	Add DDR hash module. 
+Update memory scheduler priority
+
+
+
+ 
+
+Revision History	3
+1 Overview	8
+2 Feature	10
+3 Functional Description	11
+3.1 AXI Transactions	11
+3.1.1 Transaction request	13
+3.1.2 Write and read data	14
+3.1.3 Request attributes	15
+3.2 Cache Organization	17
+3.3 Persistence and PLRU replacement	20
+3.1 Reduce the unreference cacheline persistence	21
+3.2 Reset all cacheline persistence	22
+3.3 Programming Guide	22
+3.4 Sector Cacheline and Prefetch	22
+3.4.1 Access One Sector	23
+3.4.2 Access Two Sectors	26
+3.5 Atomic Transaction	28
+3.5.1 AXI Atomic Transaction	28
+3.5.2 AXI Extented Atomic Transaction	28
+3.6 Buffer Mode	29
+3.6.1 SRAM Distribution	29
+3.6.2 Register Configuration	30
+3.6.3 Redundancy	30
+3.6.4 Programming Guide	31
+3.6 Cache Policy	32
+3.7 Coarse Flush	33
+3.7.1 Programming Guide	34
+3.8 Data Flow	34
+3.8.1 cache read	34
+3.8.2 bypass read	36
+3.8.3 cache write	37
+3.8.4 bypass write	38
+3.8.5 writeback	40
+3.9 Memory Scheduler	41
+3.10 CRM	46
+3.11 Performance Requirement	46
+4 State and Configuration	47
+CLK_CTRL3	47
+CLK_STATUS3	48
+GC_CR_PWR_MAN_HYSTERESIS	48
+GC_CR_SOFT_RESET	48
+GC_CR_CRM_RESET_CLK	48
+GC_CR_L2_CFI_OPERATION	49
+GC_CR_L2_CFI_STATUS	49
+GC_CR_L2_BUFFER_MODE	51
+GC_CR_L2_PERSIST_REDUCE	51
+GC_CR_L2_CMD	52
+GC_CR_L2G_IDLE	52
+GC_CR_L2G_ERROR3	52
+GC_CR_L2G_ERROR2	53
+GC_CR_L2G_ERROR1	54
+GC_CR_L2G_ERROR0	55
+GC_CR_L2_FUNCTION_ENABLE	56
+GC_CR_L2_MEM_SCHED_COL_OFFSET	57
+GC_CR_L2_MEM_SCHED_BANK_OFFSET	57
+GC_CR_L2_MEM_SCHED_ROW_PARTI	57
+GC_CR_L2_MEM_SCHED_ROW_PARTII	58
+GC_CR_L2_MEM_SCHED_ROW_PARTIII	58
+GC_CR_L2G_PERF_EVENT_SEL	58
+5 Design Constraint	59
+6 Interface	59
+Parameters	59
+7 Open Issues	61
+8 Hardware Architecture Description	61
+8.1 ALIGN	61
+8.1.1 Function description	61
+8.1.2 Hardware description	67
+8.2 TagCtrl	69
+8.2.1 Function Description	69
+8.3 RCTRL	82
+Function Description	82
+Hardware Description	84
+8.4 ISCHED	96
+Constraint	96
+Function Description	97
+Hardware Description	98
+8.5 Memory Scheduler	105
+8.5.1 Function Description	105
+8.5.2 Hardware Description	106
+8.6 Mem_If	107
+8.6.1 Function Description	107
+8.6.2 Hardware Description	107
+9 Area	108
+10 Performance	109
+ 
+
+1 Overview
+
+L2 cache is the last level cache. All transactions that access the DDR must pass through L2 cache. L2 cache must be able to serve for multiple masters. 
+
+L2 cache is based on AXI5 protocol. The function of L2 cache is a subset of AXI5. 
+
+L2 cache is a distributed cache, which means the cache can be duplicated to form a huge capacity cache. Each duplicated cache is independent. The L2 cache is easy to scalar up. 
+
+L2 cache is PIPT architecture. The input address is physical address. This architecture connects the L2 cache to DDR directly and reduce the chance of congestion in physical layout. 
+
+L2 cache bank is the main component of L2 cache. All the read/write/atomic transactions are all processed in L2 cache bank, as shown in Figure 1 L2 Architecture. 
+ 
+Figure 1 L2 Architecture
+Transactions are routed to L2 groups. Each group has 8 cache banks and is connected to DDR directly. The L2 groups are all independent. 
+
+
+ 
+Figure 2 L2 bank location in system
+ 
+Figure 3 L2 bank architecture
+2 Feature
+1) PIPT cache
+2) 256 KB per cache bank
+3) 256B per cacheline
+a)	2 sectors
+b)	configurable prefetch size: 128B, 256B
+4) Support cache/bypass read/write transactions
+5) Highest linefill priority
+6) Support Atomic Operation
+a)	Support FP32 operation
+7) Support persistence level
+8) Support buffer mode
+a)	Buffer size is configurable: 25%, 50%
+9) Support NSP protocol
+
+
+3 Functional Description
+3.1 AXI Transactions
+Bank supports load/store operations with different memory attributes. Based on AXI specification, transactions can be either of type Device or Normal. 
+
+A read or write transaction where the request has AxCache[1] deasserted is defined as Device transaction. Device transaction can be used to access Peripheral region or Memory locations.
+
+A read or write transaction where the request has AxCache[1] asserted is defined as Normal transaction. Normal transactions are used to access Memory locations and are not expected to access Peripheral regions. 
+
+Device transactions shall not perform lookup and cacheline allocation. They are required to pass through L2 cache. 
+
+Normal transactions will perform lookup and trigger further actions based on the memory attributes AxCache[3:0].
+
+As the last level cache in GP3 architecture, all the memory transactions will pass through L2 cache. L2 cache can be regarded as ¡®final destination¡¯ when process Write-through transactions. These transactions is observed for other master when perform lookup. All the Normal memory write transactions can return write response before receiving DDR write response.
+
+GP3 memory defines several memory transaction behaviour. The memory behaviour is identified by policy defined in SPC. AXI uses AxCache signal to identify the policy. AxCache == Write-back is treated as policy == 0. AxCache == Write-Through is treated as policy == 1.
+
+
+3.1.1 Transaction request
+3.1.1.1 Size attribute
+Refer to AXI 5 Spec.
+
+Size indicates the maximum number of bytes in each data transfer. Size must not exceed the data width of an interface.
+
+In GP3 architecture, GPC, CE and FW are assumed to issue transaction with arsize = 6 (64 bytes). But PCIE and VPU are possible to issue transaction with arsize < 6 (64 bytes). So L2 cache shall support transaction with axsize <= 6 (64bytes).
+
+For narrow transfer, Axsize < 64 bytes, blen is fixed to 0.
+3.1.1.2 Length attribute
+The Length defines the number of data transfers in a transaction.
+The total number of transfers in a transaction is Size x Length.
+A Manager must issue the number of write data transfers according to Length. A subordinate must issue the number of read data transfers according to Length. 
+
+In GP3, the number of transfers in every transaction issued to L2 cache will be limited in 2Kbit. That means Size x Length <= 256 bytes. L2 cacheline size is 256 bytes. So all transactions don¡¯t access cross cacheline even for narrow transfer.
+
+The following rules apply to transaction length:
+- For wrapping burst, Length can be 2, 4, 8 or 16.
+- For fixed burst, Length can be up to 16.
+- A transaction must not cross a 4KB address boundary.
+
+For GPC, CE and FW transaction, the Length is always less than 4. For PCIE, the Length could be any value, but the transaction that fetch more than 2Kbit data will be splited in NOC. L2 cache only see transaction with blen <= 3.
+
+3.1.1.3 Burst attribute
+The Burst attribute describes how the address increments between transfers in a transaction. L2 cache supports INCR burst types.
+
+INCR
+All transaction must not cross 2Kbit address boundary.
+((Addr[7:0] >> AxSize) << AxSize)+ AxSize x (AxLength+1)<= 256. 
+WRAP 
+The address wraps around to a lower address if an upper address limit is reached. In this burst mode, there is the constraint.
+AxSize x Length <= 256
+
+Narrow transfer constraint:
+Axsize < 64 bytes |-> AxLength == 0
+3.1.2 Write and read data
+When a Manager generates a transfer that is narrower than its data channel, the address and control information determine the byte lane that transfer uses. 
+- When Burst is INCR or WRAP, different byte lanes for each data transfer in the transaction.
+- When Burst is FIXED, the same byte lanes are used for each data transfer in the transaction.
+
+ 
+Figure 4 Narrow transfer
+
+
+3.1.3 Request attributes
+Axcache is overridden as cache policy. For more detail, please refer to section 3.6 Cache Policy.
+The combination of AxCACHE signals indicates a memory type. Table shows the memory type encodings.
+
+3.2 Cache Organization
+
+The cacheline is organized as 128 sets x 8 ways. Each set has a plru bits that points to last recently used cacheline. Every cacheline has tag field and data field. The sectors in a cacheline share addr_tag and persistence. Each sector has independent valid, beat_dirty_mask and partial state. The address on AXI request interface is always aligned to 512 bits. A cacheline is 2048-bits width. 
+ 
+
+Table 1 Cacheline Field
+Signal Name	Scope	Description
+addr_tag	cacheline	Used to perform lookup 
+persistence	cacheline	Influence the replacement 
+valid	sector	Indicates the sector is valid
+beat_dirty_mask	beat	Each bit is associated with 512 bits. If some bytes in the 512 bits are dirty, the corresponding beat_dirty_mask shall be asserted.
+partial	sector	Each bit is associated with 1024 bits. If some bytes in the 1024 bits are invalid, partial shall be asserted.
+access counter	cacheline	Indicates the number of inflight instructions on rctrl.
+initial mask	sector	Indicates the cacheline is the first time to access. If the initial mask == 0, the request shall initial total cacheline mask even if the request only access part of cacheline.
+touched_mask	cacheline	Control register specifies a time window. In the time window, if a cacheline is not referenced, touch mask is deserted. 
+Data [2047:0]	cacheline	
+Mask [255:0]	byte	Byte level mask. A bit is associated with a byte. If a bit is set, the associated byte is newer than DDR and need to be flushed to DDR when evicted.
+
+
+ 
+Figure 5 SRAM distribution
+
+3.3 Persistence and PLRU replacement
+Each cacheline has a filed named persistence [1:0]. The persistence means how long the cacheline will stay in L2 cache. 
+Persistence[1:0]	Description
+0b00	Highest priority when select a cacheline to evict
+0b01	
+0b10	
+0b11	Lowest priority when select a cacheline to evict
+
+Persistence field is filled to tag ram when allocate cacheline. The filed only influences the replacement priority. 
+
+When lookup, the TagCtrl will know the cacheline states of the specific set, valid, partial or just dirty. Furthermore, TagCtrl also know which cacheline is inflight. These cachelines are also named active cachelines. Active cachelines cannot be replaced. Inactive cachelines may be invalid, dirty, clean state. The invalid cachelines always takes priority to be replaced. Then the cacheline with persistence == 0 will be replaced.
+
+replace_way[2:0] = (&active_mask == 1¡¯b0)? empty_replace_way :
+(&persistence0_mask == 1¡¯b0) ? persistence0_way:
+(&persistence1_mask == 1¡¯b0) ? persistence1_way:
+(&persistence2_mask == 1¡¯b0) ? persistence2_way:
+persistence3_way;
+Persistence for an address region should remain stable. It means if any axi request hit on a cacheline, the persistence field in tag ram and request shall be the same. Assertion is considered to add to check the behavior in system test.
+
+A persistence L2 cacheline from a previous kernel may persist in L2 long time after it has been used. L2 bank provides two methods to reduce the persistence value.
+
+3.1 Reduce the unreferenced cacheline persistence
+Using a flag named ¡®touched_mask¡¯ to track if a cacheline is referenced in a specific time window. Bank generate a persistence reduce command to unroll all set. If the flag ¡®touched¡¯ of cacheline is set, the persistence value should remain stable. Otherwise, the persistence value will decrease by 1.
+
+Note: If a cacheline is only used once, the persistence value should also decrease. So, touched_mask is set only when hit the cacheline. The touched_mask is still zero when cacheline is first allocated.
+
+?	Touched_mask is set to 1 only when request hit cacheline;
+?	Touched_mask is cleared when receive reduce persistence command or clear persistence command.
+
+
+3.2 Reset all cacheline persistence
+Persistence reset command is issued via socif interface. Bank will unroll all set and reset persistence to zero. The command doesn¡¯t change other cacheline status.
+3.3 Programming Guide
+reset all cacheline persistence
+Write32(GC_CR_L2_CMD, 0x1)
+reduce unreferenced cacheline persistence every 0x1f_ffff_fff cycles 
+Write32(GC_CR_L2_PERSIST_REDUCE, 0x3f_ffff); 
+
+It is possible to trigger clear persistence operation by write64(GC_CR_L2_CMD). To improve system robust, L2 will ignore the second write notify. 
+
+
+3.4 Sector Cacheline and Prefetch 
+Each cacheline has two sectors. The sector has independent state and flags. The request is possible to access a single sector and two sectors. The prefetch size carried on AXI.user also has effect.
+
+When a bypass read request comes with prefetch == 1, the prefetch will be overrode as 0 to indicates prefetch size has no effect on bypass read request.
+
+Each sector has INVALID, DIRTY, PARTIAL and CLEAN state.
+INVALID state:  valid = 0;
+DIRTY state:    valid = 1; beat_dirty_mask!= 0; partial = 0;
+PARTIAL state:  valid = 1; beat_dirty_mask!= 0; partial != 0;
+CLEAN state:   valid = 1; beat_dirty_mask == 0; partial == 0;
+
+sector: valid, beat_dirty_mask [1:0], partial;
+
+Linefill: Read data from DDR and write to cacheline.
+Any write transaction will not trigger linefill when miss. So partial bit shall sit alongside sector. 
+
+Prefetch size is only applied to cacheable read and atomic request. The prefetch size on write transactions will be ignored.
+3.4.1 Access One Sector
+Table 2 Behavior When Access One Sector
+Operation	Policy	State	Description
+AXI_RD	0	miss	?	Allocate cacheline and trigger linefill.
+?	return data after linefill completion
+		INVALID	?	Trigger linefill.
+?	return data after linefill completion
+		DIRTY/CLEAN	Return data 
+		PARTIAL	?	Trigger linefill
+?	Merge linefill data with cacheline data
+?	Return data after linefill completion.
+	1	miss	?	don¡¯t allocate cacheline. 
+?	bypass the request to DDR. 
+		INVALID	Refer to policy == 0
+		DIRTY/CLEAN	Refer to policy == 0
+		PARTIAL	Refer to policy == 0
+AXI_ST	0	miss	?	allocate cacheline
+?	write data to cacheline directly without linefill
+		INVALID	?	write data to cacheline directly without linefill
+		DIRTY/CLEAN	?	write data to cacheline 
+		PARTIAL	?	write data to cacheline.
+	1	miss	?	Bypass request to DDR, doesn¡¯t allocate cacheline
+		INVALID
+/DIRTY
+/CLEAN
+/PARTIAL	?	Refer to 3.4.2
+?	Bypass write always invalid a cacheline. The behavior shall consider another sector status.
+AXI_AA	-	miss	?	allocate cacheline and trigger linefill. 
+?	perform aa operation after linefill completion.
+		INVALID	?	trigger linefill. 
+?	perform aa operation after linefill completion.
+		DIRTY/CLEAN	?	perform aa operation
+		PARTIAL	?	trigger linefill 
+?	perform aa operation after linefill completion
+
+
+3.4.2 Access Two Sectors
+Prefetch size is carried on axi.user. Prefetch size is 128B by default. 256B is optional. Prefetch size is applied for read transactions because write transaction don¡¯t trigger linefill when miss. When transaction access two sectors or access one sector with prefetch size 256B, two sector states must be considered.
+
+Table 3 Behavior When Access Two Sectors
+Operation	Policy	Sector State	Description
+AXI_RD	0	{INVALID, X}
+{X, INVALID}	?	Trigger linefill 
+?	return data after linefill completion
+		{CLEAN/DIRTY, CLEAN/DIRTY}	?	return data 
+		{PARTIAL, CLEAN/DIRTY}
+{CLEAN/DIRTY, PARTIAL }	?	trigger linefill 
+?	return data after linefill completion
+	1	{INVALID, INVALID}	Don¡¯t allocate cacheline, bypass request to DDR
+		{CLEAN/DIRTY, CLEAN/DIRTY}	Refer to policy == 0
+		{PARTIAL, CLEAN/DIRTY}
+{CLEAN/DIRTY, PARTIAL }	Refer to policy == 0
+AXI_WR	0	{INVALID, INVALID}	?	Allocate cacheline.
+?	Write data to cacheline without linefill
+		{PARTIAL/CLEAN/DIRTY/INVALID, PARTIAL/CLEAN/DIRTY/INVALID}	Write data to cacheline 
+	1	{INVALID, INVALID}	Don¡¯t allocate cacheline. 
+		{CLEAN, CLEAN}	Invalidate cacheline and bypass request
+		{PARTIAL/DIRTY, XXX}
+{XXX, PARTIAL/DIRTY}	?	Merge the cacheline with write data and flush to DDR. 
+?	Invalidate cacheline.
+AXI_AA	-	{INVALID, INVALID}
+	?	allocate cacheline. 
+?	perform aa operation after linefill completion
+		{PARTIAL/INVALID, XXX}
+{XXX, PARTIAL/INVALID}	?	trigger linefill. 
+?	perform aa operation after linefill completion
+		{CLEAN/DIRTY, CLEAN/DIRTY}	perform aa operation 
+
+3.5 Atomic Transaction
+Exclusive access is not supported. axlock is always asserted to 0.
+3.5.1 AXI Atomic Transaction
+AXI atomic transaction is not supported.
+
+3.5.2 AXI Extended Atomic Transaction
+
+GPU defines two atomic operation, atomic64 and atomic32. MCU L1 is able to merge atomic operations and issue to L2. The majority of Atomic operations use a single operand in combination with the destination address with the exception of CMPXCHG which has 2 operands. 
+
+PCIE and VPU atomic transactions will be transferred to GPC specific atomic transaction.
+
+The AXI extended atomic transaction refer to 01.Documents/GP3/02.Tech/02.Architecture/03.Spec/GPU_Ordering_System_Design_CHS_V0PXX.docx
+
+
+3.6 Buffer Mode
+Buffer mode is also named as scratch memory. The storage for buffer mode is configurable. Address range is specific by register. Once the address is located in the buffer mode address range, the request is called scratch request. Different than normal request, scratch request doesn¡¯t perform lookup and therefore doesn¡¯t need to replace or allocate cacheline. A fixed percentage capacity of L2 cache is used for buffer mode. If buffer mode function is enabled, the address access the L2 cache is derived from pa.
+
+3.6.1 SRAM Distribution
+GC_CR_L2_BUFFER_PERCENTAGE has three configurations:
+0x0: Disable buffer mode
+0x1: 25% of L2 cache
+0x2: 50% of L2 cache
+0x3: reserved
+
+The SRAM address is derived from the OffsetAddr.
+set[6:0] = Addr[14:8]
+way[2:0] = Addr[16:15] + 6, when 25%
+way[2:0] = Addr[16:15] + 4, when 50%
+beat[1:0] = Addr[7:6]
+SramAddr = {way, set, beat}
+
+
+
+
+
+3.6.2 Register Configuration
+
+Register Name	Description
+GC_CR_L2_BUFFER_BASE[47:0] 	Buffer mode base address
+GC_CR_L2_BUFFER_PERCENTAGE	Buffer mode storage 
+00: 0% 
+01: 25%
+10: 50%
+11: reserved
+
+
+BUFFER_PERCENTAGE	Cache Size	Buffer Size	Buffer Size of each L2 Bank (80 banks)
+2¡¯b00, 0%, disable	20MB	0MB	0KB
+2¡¯b01, 25%	15MB	5MB	64KB
+2¡¯b10, 50%	10MB	10MB	128KB
+2¡¯b11	NA	NA	NA
+
+3.6.3 Redundancy
+If one bank is broken, the original request to the bank will be routed to another bank. The storage for buffer mode will decrease. For example, bank 0 is broken but bank 1, 2, 3 work well. The request to bank 0 will be routed to bank 3. The original buffer mode address space for bank 3 disappear. Hash algorithm will modify the buffer mode request address to avoid accessing the broken bank 0.
+ 
+Figure 6 Bank redundancy for buffer mode
+3.6.4 Programming Guide
+Buffer mode can be configured after reset and before NOC issue transactions. Until next reset, the configuration can¡¯t change.
+
+
+
+
+
+
+
+3.6 Cache Policy
+Cache policy is derived from axcache[0]. Cache policy == 0 whe axcache[0] == 1. Cache policy == 1 when axcache[0] == 0.
+
+Table 4 Bahavior of different operations
+Operation	Cache Policy	Hit/Miss	Description
+AXI_RD	0	-	1. Allocate cacheline.
+2. perform linefill when miss or hit partial sector or invalid sector
+3. return data from L2C
+	1	Hit	1. Issue linefill to DDR when hit partial sector or invalid sector. [1]
+2. Return data from L2C.
+	1	Miss	1. Doesn't allocate cacheline. 
+2. bypass request to DDR.
+3. return data to NOC
+AXI_WR	0	-	1. return early write response
+2. allocate cacheline 
+3. write data to cacheline
+	1	Hit	1.return early write response
+2.invalid cacheline
+3. merge cacheline data with write data if hit partial or dirty cacheline.
+4. bypass request to DDR.
+	1	Miss	1. return early write response
+2. bypass request to DDR
+AXI_AA	-	-	1. return early write response
+2. allocate cacheline
+3. trigger linefill when hit partial or invalid sector
+4. perform atomic
+5. return original data.
+
+[1]. prefetch_size doesn't affect the burst length of linefill triggered by bypass read.
+
+From NOC perspective, the different cache policy has the following behavior.
+Bypass read/write
+- A cache lookup is required for read and write transactions
+- The write response can be obtained from L2 cache.
+- Read data can be obtained from L2 cache or DDR.
+- Write transactions are required to be made visible at DDR.
+- Allocation of write transactions is not required. 
+- Allocation of read transactions is not required.
+
+Cache read/write
+- A cache lookup is required for read and write transactions
+- The write response can be obtained from L2 cache.
+- Read data can be obtained from L2 cache.
+- Write transaction are not required to be made visible at DDR.
+- Allocation of write transaction is required.
+- Allocation of read transaction is required.
+
+3.7 Coarse Flush
+Flush is issued through socif interface. Flush transaction and NOC transactions are issued in parallel. L2 cache has no constraint requirement on the order of Flush and NOC transactions. 
+
+Flush will unroll all the cacheline and writeback all the dirty cacheline. If some cacheline is still in progress, the unroll progress shall be stalled. All writeback request will be issued on NSP interface.  If the unroll process is not finished, the NOC transaction shall stall. 
+
+Flush, FlushInval are generated by register. Invalidate is generated when reset by L2 cache. The instruction is used to initial tag ram.
+
+Table 5 CFI operation behavior
+Operation	Encoding	Description
+Invalid	0x0	?	Invalidation doesn¡¯t care about the cacheline status.
+?	Invalid is recommended to be used when all cacheline is in idle status.
+?	Invalid cannot affect inflight request in L2. If L2 receive INVALID, the inflight request shall return correct data to NOC as normal.
+?	When reset, an invalid operation will be generated to initial tag ram.
+Flush	0x1	?	Flush dirty cacheline. The cacheline still persist in L2 cache.
+?	The partial cacheline will be evicted to DDR.
+FlushInval	0x2	?	Flush and invalidate cacheline. 
+?	All dirty/partial cacheline shall be written back to DDR.
+
+3.7.1 Programming Guide
+It is recommended to call write32 to trigger CFI operation because write64 will trigger two CFI operations. If software wants to perform any operation after CFI is finished, please call POLL(CFI_STATUS, 0xffffffff_fffffff). When CFI is finished, the function can move forward.
+Write32(GC_CR_L2_CFI_OPERATION, 0x1);
+POLL(GC_CR_L2_CFI_STATUSI, 0xffffffff_fffffff);
+POLL(GC_CR_L2_CFI_STATUSII, 0xffff);
+
+
+It is possible to trigger CFI operations by write64(GC_CR_L2_CFI_OPERATION). To improve system robust, L2 will ignore the second write notify. 
+
+
+3.8 Data Flow
+3.8.1 cache read
+ 
+Figure 7 Cache read miss data flow
+1) NOC issue read transaction to bank
+2) align issues cache read transactions to TagCtrl to perform hit test;
+3) replace a clean cacheline, issue RD instruction to ISCHED to wait for linefill completion. issue initial mask clear pulse to RCTRL to clear the cacheline initial mask. trigger linefill to MEM_IF;
+4) issue PA to Mem Scheduler 
+5) Mem Scheduler return PA and trans id;
+6) allocate rob index and nsp ID. issue read transaction to DDR
+7) receive DDR read data response
+8) perform linefill
+9) linefill complete and issue pulse to fetch instructions from ISCHED
+10) issue RD instruction to read data
+11) return cacheline data to Align
+
+cache read hit partial cacheline is same data flow as cache read miss without clearing initial mask.
+ 
+Figure 8 Cache read hit data flow
+1) NOC issue read transaction
+2) Align issue cache read transaction and perform hit test
+3) lookup hit. TagCtrl issue RD instruction to ISCHED.
+4) ISCHED issue RD instruction to RCTRL to read data
+5) RCTRL return data to ALIGN
+3.8.2 bypass read
+ 
+Figure 9 Bypass read miss data flow
+1) NOC issue read transaction
+2) issue bypass read transaction and perform hit test
+3) lookup miss, doesn¡¯t allocate cacheline. 
+4) issue PA to Mem Scheduler 
+5) Mem Scheduler return PA and trans id;
+6) allocate nsp ID and rob index. Then issue read transaction to DDR
+7) DDR return data. TagCtrl hold the data in ROB
+8) When receive the last beat data, return the data to through bypass read return channel.
+3.8.3 cache write
+ 
+Figure 10 Cache write miss data flow
+1) receive request in aw channel and wdata channel
+2) the write transactions is issued to TagCtrl to perform lookup. ALIGN allocates IWDB index to store the write data.
+3) after sync aw and wdata channel and arbitered with read request, return early write response. As long as there is enough space in IWDB to hold the pending write data, the request can be issued to TagCtrl. Bank return early write response after the request is arbitrated and all the pending write data arrives.
+4) lookup miss, allocate a cacheline. TagCtrl issue WR instruction to ISCHED. At the same time, clear the initial mask.
+5) ISCHED issue IWDB request to WDC.
+6) WDC fetch data from IWDB
+7) IWDB return data and free IWDB index.
+8) WDC return IWDB data to ISCHED
+9) ISCHED issue WR instruction with write data to RCTRL. Return response to TagCtrl to decrease cacheline access counter.
+
+3.8.4 bypass write
+3.8.4.1 bypass write miss
+ 
+Figure 11 Bypass write miss data flow
+1)	receive request in aw channel and wdata channel
+2)	the write transactions is issued to TagCtrl to perform lookup. ALIGN allocates IWDB index to store the write data.
+3)	after sync aw and wdata channel and arbitered with read request, return early write response. As long as there is enough space in IWDB to hold the pending write data, the request can be issued to TagCtrl. Bank return early write response after the request is arbitrated and all the pending write data arrives.
+4)	issue WT instruction to MEMIF
+5)	issue PA to Mem Scheduler 
+6)	Mem Scheduler return PA and trans id;
+7)	issue WT instruction to WDC to fetch write data
+8)	WDC issue IWDB request
+9)	IWDB return data and IWDB index free
+10)	IWDB return data to WDC
+11)	WDC return data to TagCtrl to sync
+12)	MEMIF issue write request with write data to scheduler.
+3.8.4.2 bypass write hit dirty cacheline
+ 
+Figure 12 Bypass write hit on dirty cacheline data flow
+1)	receive request in aw channel and wdata channel
+2)	the write transactions is issued to TagCtrl to perform lookup. ALIGN allocates IWDB index to store the write data.
+3)	after sync aw and wdata channel and arbitered with read request, return early write response. As long as there is enough space in IWDB to hold the pending write data, the request can be issued to TagCtrl. Bank return early write response after the request is arbitrated and all the pending write data arrives.
+4)	issue WB_WR instruction to MEMIF
+5)	issue PA to Mem Scheduler 
+6)	Mem Scheduler return PA and trans id;
+7)	MEMIF issue WB_WR to WDC to fetch write data;
+8)	WDC issue WB_WR to ISCHED to split request;
+9)	ISCHED fetch bypass write data through WDC
+10)	WDC issue IWDB request
+11)	IWDB return data and free iwdb index
+12)	WDC return data to ISCHED
+13)	ISCHED issue WB_WR to RCTRL.
+14)	RCTRL merge the bypass write data with cacheline data and return the data to WDC
+15)	WDC return the data to MEMIF
+16)	MEMIF sync write command and write data. Issue write transaction to DDR
+17)	DDR return write response.
+
+
+3.8.5 writeback
+ 
+Figure 13 Cache read miss on dirty cacheline
+1) NOC issue cache read transaction to perform lookup.
+2) lookup miss and replace dirty cacheline.  
+3) Issue RD instruction to ISCHED first and issue WB instruction and linefill instruction MEMIF
+4) issue write back PA to Mem Scheduler 
+5) issue linefill PA to Mem Scheduler
+6) Mem Scheduler return PA and trans id;
+7) issue WB instruction to WDC to fetch write data.
+8) WDC issue WB instruction to ISCHED to split
+9) ISCHED issue WB to RCTRL
+10) RCTRL read data and return to WDC
+11) WDC return the data to MEMIF
+12) MEMIF sync wdata and write request then issue write transaction to DDR via NSP interface
+13) Issue read transaction to DDR via NSP interface. 
+14) receive read response and perform linefill
+15) linefill complete and notify ISCHED
+16) ISCHED issue RD instruction to RCTRL
+17) RCTRL return data to align
+
+
+It is possible that bypass write only access some beats, but all the beats are dirty. RCTRL need to readout all the beats but just merge some beats data with bypass write data. In ISCHED, WB_WR can be transferred to WB when the beat doesn¡¯t need to be merged with bypass write data.
+
+3.9 Memory Scheduler
+DDR background:
+LPDDR supports up to 8GB capacity. Each LPDDR has 16 banks. These banks are divided to 4 bank groups. Different with GDDR, bank groups inside LPDDR are independently. Banks inside bank group are processed in order. To utilize LPDDR bandwidth, it is better to distributes requests to different LPDDR bank groups to hide the latency of activating LPDDR bank. 
+
+Memory scheduler is used to interleave request to different LPDDR bank groups and reorder request in a time window to select different bank groups. It is possible that a burst request accesses multiple DDR bank group. If so, memory scheduler should be disabled because it is meaningless to schedule request. Memory scheduler only works when request only access a DDR bank group.
+
+Hash function is applied to interleave request to different LPDDR bank groups. Figure 12 shows how PA(physical address) flows from BIF2AXI to DDR. L2 bank also instantiate DDR Hash module to generate new DDR bank. 
+
+Use hash function to distribute request to different DDR banks.
+
+ 
+Figure 14 Memory scheduler scheme
+DDR controller will remap address to bank and row index based on configure register gc_l2_bank_rowid_offset [16:0][4:0] and gc_l2_bank_bankid_offset[3:0][4:0]. In DDR, the LSB two bits will be abandoned. Therefore, the offset starts from bit 2. The real offset = gc_*_offset + 2;
+ 
+hash_bank_id[3:0]= DDR_Hash(hash_pa0[32:0], gc_l2_bank_rowid_offset, gc_l2_bank_bankid_offset);
+hash_pa1 = hash_pa0;
+for (int i = 0; i < 4; i ++) 
+	real_bankid_offset[i] = gc_l2_bank_bankid_offset[i]+2;
+	hash_pa1[real_bankid_offset[i]] = hash_bank_id[i];
+	bank_id[i] = hash_bank_id[i];
+	assert (~real_bankid_offset[i] inside {0,1,2,3,4,5,6,7, 33});
+for (int i = 0; i < 17; i ++) 
+	real_rowid_offset[i] = gc_l2_bank_rowid_offset[i]+2;
+	rowid[i] = hash_pa0[real_rowid_offset[i]]; // ignore MSB 2 bits when configure 0.5GB/CH
+	assert (~real_rowid_offset [i] inside {0,1,2,3,4,5,6,7, 33}); 
+for (int i = 0; i < 6; i ++)
+	real_columnid_offset[i] = gc_l2_bank_column_offset[i]+2;
+	columnid[i] = hash_pa0[real_columnid_offset[i]];
+	assert(~(real_columnid_offset[i] inside {0,1,2,3,4, 33}));
+hash_pa1[5:0] = 0;
+?	hash_pa0 is 34 bits and can access 16 GB address space. The MSB indicates which DDR channel hash_pa0 is going to. It can¡¯t be hashed.
+?	Memory scheduler can¡¯t reorder the requests that access the same cacheline, so memory scheduler doesn¡¯t care about hash_pa0[7:0].
+?	When configure gc_l2_bank_rowid_offset and gc_l2_bank_bankid_offset, they cannot point to 7 and 6 to ensure that data in a cacheline locate in same DDR row and DDR bank.
+?	It¡¯s not recommended to enable L2 memory scheduler and DDR hash at the same time. When two DDR hash are both enabled, the DDR scheduler will get raw DDR bank id. The DDR hash function is disabled.
+?	When disable L2 memory scheduler, the address and order that issued to DDR is the original address and order.
+ 
+Figure 15 GDDR SGRAM addressing
+Figure 13 shows LPDDR5 has fixed banks width and column bits. Row width has several configurations.
+Table 6 DDR Row Width Configuration
+Row Bits	DDR Density	Register Configuration
+13	2Gb	0x0
+14	3Gb, 4Gb	0x1
+15	6Gb, 8Gb	0x2
+16	12Gb, 16Gb	0x3
+17	24Gb, 32Gb	0x4
+
+Define 4 bits in GC_CR_L2_FUNCTION_ENABLE[7:4] to note what DDR density is. 
+Table 7 Address used for scheduler
+	0x0	0x1	0x2	0x3	0x4
+RowID[16]	0	0	0	0	hash_pa0[real_rowid_offset[16]]
+RowID[15]	0	0	0	hash_pa0[real_rowid_offset[15]]	hash_pa0[real_rowid_offset[15]]
+RowID[14]	0	0	hash_pa0[real_rowid_offset[14]]	hash_pa0[real_rowid_offset[14]]	hash_pa0[real_rowid_offset[14]]
+RowID[13]	0	hash_pa0[real_rowid_offset[13]]	hash_pa0[real_rowid_offset[13]]	hash_pa0[real_rowid_offset[13]]	hash_pa0[real_rowid_offset[13]]
+RowID[12]	hash_pa0[real_rowid_offset[12]]	hash_pa0[real_rowid_offset[12]]	hash_pa0[real_rowid_offset[12]]	hash_pa0[real_rowid_offset[12]]	hash_pa0[real_rowid_offset[12]]
+
+ Figure 16 Memory scheduler integration
+When bank need to read or write DDR, a PA is issued to mem scheduler and stored in PA queue. The PA queue records the original order using drop queue. Each PA queue will select a PA. When a PA is issued back to the its own bank, send the row id to tell its own queues output the the same row id request. otherwise queue need to output different DDR bank requests. If queue doesn¡¯t have same row id request or different bank request, then output the oldest request. The output request will be issued to corresponding bank with PA. 
+
+Two banks share a memory scheduler. 
+?	If two bank work, bank0 request will be routed to PA queue0, bank1 request will be routed to PA queue1. 
+?	If bank0 is broken, the PA[33] of bank1 can be 0 or 1. When MSB is 1, the request will be routed to PA queue1. When MSB is 0, the request will be routed to PA queue0.
+?	PA queue0 always see PA[32] is 0. PA queue1 always see PA[32] is 1.
+
+The scheduler has the following priority:
+- out of time oldest request
+- request with same row id and same bank id has the second priority, 
+- request with different DDR bank id has the third priority (based on LRU algorithm)
+The oldest request is defined as a request whose subsequent N-1 requests are all outputted. N is the depth of PA queue. For example, given an input sequence as the following and assume PA queue depth is 4.
+req 0 -> req 1 -> req 2 -> req 3 -> req 4 -> req 5 -> req 6.
+?	Req 0 becomes oldest request when req 1,2,3 get higher priority and are all outputted.
+?	Req 1 becomes oldest request when req 2,3,4 get higher priority and are all outputted.
+?	If multiple requests in PA queue that satisfy the above condition at the same time, the oldest request is the first request. When req 2,3,4 get higher priority and outputted, req 0 and req 1 both satisfy the definition, only req 0 will be treated as the oldest request.
+3.9.1 LRU algorithm
+For timing concern, DDR bank is divided 8 bank groups. 
+?	When reset, bank 0-15 have the priority from high to low.
+?	When memory scheduler selects bank 1, the priority from high to low is bank 4,5,6,7,8,9,10,11,12,13,14,15,2,3,0,1.
+?	When memory scheduler selects bank 6, the priority from high to low is bank 4,5,6,7,0,1,3,2. 
+?	When memory scheduler selects bank group 0, the priority from high to low is bank 4,5,6,7,3,2,1,0.
+?	When pa queue has multiple request that access same bank group, memory scheduler will select the oldest one
+
+ 
+Figure 17 LRU algorithm update process
+
+
+3.10 CRM
+ 
+Figure 18 L2 CRM integration
+
+To reduce the power consumption, CRM is added to turn off the bank clock when no request is processed in bank. CRM serves two banks and their memory scheduler. If one of the banks receive request from NOC, CRM will generate clock to drive bank0, bank 1 and memory scheduler.
+
+Each bank is connected to DDRC directly. When one bank is broken, the request is routed to another bank. A crossbar sits between bank and DDRC. The crossbar will route the bank request to 2 DDRC. It is not possible that two bank access two DDRC at the same time.
+
+The softreset port on CRM is tied to zero because GPU cannot softreset L2 when other remote applications access L2.
+clock and reset sequential diagram of L2 group is show as figure below.
+ 
+
+3.11 Clear Partial
+It is possible that AXI master write a whole sector or cacheline. Partial flag alongside cacheline shall be cleared to avoid fetching unnecessary data from DDR when hit by read command. Clear partial can save bandwidth of DDR and reduce pressure for DDR. If clear partial is not supported, Bank also works well. It is an optimization for performance. 
+
+Due to bank microarchitecture constraint, command and data is processed independently. Only when write operation is going to write whole sector or cacheline, clear partial may be triggered.
+
+When miss, if cache write is going to write whole sector or cacheline, issue check_partial[1:0] to RamCtrl and check if the bytes of corresponding sector are all written. If bytes are written, return clear partial to TagCtrl. 
+For example,
+?	start_beat = 0b00, blen = 0b1, check_partial[1:0] = 0b01; 
+?	start_beat = 0b00, blen = 0b10, check_partial[1:0] = 0b01;
+
+When hit, only the partial or invalid sector will be considered to clear partial. When cache write is going to write the whole sector, issue check_partial[1:0] to RamCtrl. 
+For example,
+?	hit cacheline status is valid[1:0] = 0b11, partial[1:0] = 0b11, beat_dirty_mask[3:0] = 0b1111; start_beat = 0b00, blen = 0b01, check_partial = 0b01;
+?	hit cacheline status is valid[1:0] = 0b11, partial[1:0] = 0b11, beat_dirty_mask[3:0] = 0b0111; start_beat = 0b00, blen = 0b02, check_partial = 0b01;
+?	hit cacheline status is valid[1:0] = 0b11, partial[1:0] = 0b10, beat_dirty_mask[3:0] = 0b0111; start_beat = 0b01, blen = 0b01, check_partial = 0b00;
+Here is the pseudo code .
+n_dirty_mask[3:0] = 4¡¯d0;
+case (blen)
+	2¡¯b00: n_dirty_mask = 4¡¯b0001;
+	2¡¯b01: n_dirty_mask = 4¡¯b0011;
+	2¡¯b10:n_dirty_mask = 4¡¯b0111;
+	2¡¯b11:n_dirty_mask = 4¡¯b1111;
+endcase
+If (hit)
+n_dirty_mask = hit_cacheline_dirty_mask | (n_dirty_mask << start_beat[1:0]);
+else 
+	n_dirty_mask = n_dirty_mask << start_beat[1:0]
+
+end_beat[1:0] = start_beat[1:0] + blen[1:0];
+access_mask[1:0] = {end_beat[1], start_beat[0]};
+
+if (hit)
+if (access_mask[0]) // access the first sector
+		if (hit_cacheline_valid[0] && hit_cacheline_partial[0] | ~hit_cacheline_valid[0])
+			check_partial[0] = &n_dirty_mask[1:0]; 
+if (access_mask[1]) // access the second sector
+		if (hit_cacheline_valid[1] && hit_cacheline_partial[1] | ~hit_cacheline_valid[1])
+			check_partial[1] = &n_dirty_mask[3:2];
+else 
+	check_partial[0] = {n_dirty_mask[1:0]}
+check_partial[1] = {n_dirty_mask[3:2]}
+
+for (i=start_beat; i <= end_beat; i++) 
+	mask_data[i*64+:] = mask_data[i*64+:] | wstrb[63:0];
+
+clear_partial[0] = check_partial[0] ? &mask_data[127:0] : 1¡¯b0;
+clear_partial[1] = check_partial[1] ? &mask_data[255:128] : 1¡¯b0;
+partial[1:0] = partial[1:0] & ~clear_partial[1:0]
+
+
+ 
+Figure 19 Clear partial process flow
+As shown in this figure, check_partial is issued by TagCtrl and bypass Isched. RamCtrl will check mask ram data when check_partial is set. If the corresponding mask ram is all written, return clr_partial to TagCtrl to clear partial flag.
+
+Before clear partial, TagCtrl can also issue a request with check_partial to Isched again. 
+
+3.12 Redundancy
+To reduce the cost of tape-out, our design provides a method to walk around the broken bank.
+From DFT perspective
+
+Module	Area (8 banks version)	Scope
+Bank	19.2w x 8 = 153.6w	Bank
+Memory Scheduler	7.4w	Bank group
+NSP Crossbar		
+CRM		
+Int_pipe		
+Regbank		
+ADB		
+Misc		
+
+Bank is hardened independently. DFT will know if some bank is broken. But for the common module, such as CRM, regbank, DFT only knows if some logic in these modules is broken. If some logic in these modules is broken, the corresponding bank group is abandoned. 
+
+From NOC perspective  
+If just a single bank is broken, the request will be routed to another bank. For example£º
+?	bank 0 is broken, the request is routed to bank 1. Bank 1 can access both DDRCs. 
+?	Bank 0 and bank 1 are broken, the request will be routed to other banks and the corresponding DDRCs are disabled.
+If other modules like CRM is broken, the request will be routed to other bank groups. For example:
+?	If CRM is broken, the L2G is abandoned, even if all the banks work.
+
+4 State and Configuration
+CLK_CTRL3
+Addr: 0x00a0; Type: RW
+		15:14	13:12	11:10
+		L2G7	L2G6	L2G5
+9:8	7:6	5:4	3:2	1:0
+L2G4	L2G3	L2G2	L2G1	L2G0
+
+00: OFF  (The domain clock is forced off)
+01: ON	(The domain clock is forced on)
+10: AUTO (Automatic clocking gating is active). Default value.          
+If this filed is set to 0b01, all L2 banks clocks are forced on.
+
+CLK_STATUS3
+Addr: 0x00a8; Type: RO
+		7	6	5
+		L2G7	L2G6	L2G5
+4	3	2	1	0
+L2G4	L2G3	L2G2	L2G1	L2G0
+
+If this field is set, the clock of one of 80 banks is running. 
+GC_CR_PWR_MAN_HYSTERESIS
+63:5	4:0
+Reserved	value
+Number of hysteresis clock cycles for clock management module. This value cannot be less than 0xf.
+
+GC_CR_SOFT_RESET
+Addr: 0x0100, RW
+63:8	7	6:0
+Others	L2G	Others
+
+This register is removed because L2 is accessed by other data masters like VPU and PCIE.
+GC_CR_CRM_RESET_CLK
+Addr: 0xf278
+63:5	1:0
+Reserved	CTRL
+       
+value OFF   0x0 {Clock always OFF during reset.}
+value ON_16 0x1 {Clock ON for 16 clock cycles during reset.}
+value ON_64 0x2 {Clock ON for 64 clock cycles during reset.}
+value ON    0x3 {Clock always ON during reset.}
+This register doesn¡¯t work because soft reset is disabled.
+GC_CR_L2_CFI_OPERATION
+Addr: 0xe000; Type: RW, write notify
+63:2	1:0
+Reserved	CFI_OPERATION
+ 
+CFI operation encoding:
+INVALID: 2¡¯00
+FLUSH: 2¡¯01
+FLUSH_INVALID:2¡¯b10
+
+Any CFI operation will clear GC_CR_L2_CFI_STATUSI and GC_CR_L2_CFI_STATUSII value.
+
+GC_CR_L2_CFI_STATUSI
+*Addr: 0xe008; Type: RO
+	63	62	61	60
+	L2B77	L2B76	L2B75	L2B74
+59	58	57	56	55
+L2B73	L2B72	L2B71	L2B70	L2B67
+54	53	52	51	50
+L2B66	L2B65	L2B64	L2B63	L2B62
+49	48	47	46	45
+L2B61	L2B60	L2B57	L2B56	L2B55
+44	43	42	41	40
+L2B54	L2B53	L2B52	L2B51	L2B50
+39	38	37	36	35
+L2B47	L2B46	L2B45	L2B44	L2B43
+34	33	32	31	30
+L2B42	L2B41	L2B40	L2B37	L2B36
+29	28	27	26	25
+L2B35	L2B34	L2B33	L2B32	L2B31
+24	23	22	21	20
+L2B30	L2B27	L2B26	L2B25	L2B24
+19	18	17	16	15
+L2B23	L2B22	L2B21	L2B20	L2B17
+14	13	12	11	10
+L2B16	L2B15	L2B14	L2B13	L2B12
+9	8	7	6	5
+L2B11	L2B10	L2B7	L2B6	L2B5
+4	3	2	1	0
+L2B4	L2B3	L2B2	L2B1	L2B0
+
+GC_CR_L2_CFI_STATUSII
+Addr:0xe0a0; Type: RO
+19	18	17	16	15
+				L2B79
+14	13	12	11	10
+L2B78	L2B69	L2B68	L2B59	L2B58
+9	8	7	6	5
+L2B49	L2B48	L2B39	L2B38	L2B29
+4	3	2	1	0
+L2B28	L2B19	L2B18	L2B9	L2B8
+
+
+GC_CR_L2_BUFFER_MODE
+Addr: 0xe018; Type: RW
+63:2	1:0
+Reversed	BUFFER_MODE_PERCENTAGE
+
+GC_CR_L2_PERSIST_REDUCE
+Addr: 0xe020; Type: RW
+63:32	21:1	0
+Reversed	PERSIST_REDUCE_THRSHOLD	PERSIST_REDUCE_ENABLE
+
+A 16-bit counter sit in L2_bank. This counter can reach about 216 cycles.
+The threshold specifies the multiplier of maximum counter value.
+GC_CR_L2_CMD
+Addr: 0xe028; Type: RW, write notify
+63:2	1	0
+Reversed	L2_CFI_CLR	PERSISTENT_RST_ALL
+
+GC_CR_L2G_IDLEI
+*Addr: 0xe030; Type: RO
+	63	62	61	60
+	L2B77	L2B76	L2B75	L2B74
+59	58	57	56	55
+L2B73	L2B72	L2B71	L2B70	L2B67
+54	53	52	51	50
+L2B66	L2B65	L2B64	L2B63	L2B62
+49	48	47	46	45
+L2B61	L2B60	L2B57	L2B56	L2B55
+44	43	42	41	40
+L2B54	L2B53	L2B52	L2B51	L2B50
+39	38	37	36	35
+L2B47	L2B46	L2B45	L2B44	L2B43
+34	33	32	31	30
+L2B42	L2B41	L2B40	L2B37	L2B36
+29	28	27	26	25
+L2B35	L2B34	L2B33	L2B32	L2B31
+24	23	22	21	20
+L2B30	L2B27	L2B26	L2B25	L2B24
+19	18	17	16	15
+L2B23	L2B22	L2B21	L2B20	L2B17
+14	13	12	11	10
+L2B16	L2B15	L2B14	L2B13	L2B12
+9	8	7	6	5
+L2B11	L2B10	L2B7	L2B6	L2B5
+4	3	2	1	0
+L2B4	L2B3	L2B2	L2B1	L2B0
+
+GC_CR_L2G_IDLEII
+Addr: 0xe098. Type: RO
+19	18	17	16	15
+				L2B79
+14	13	12	11	10
+L2B78	L2B69	L2B68	L2B59	L2B58
+9	8	7	6	5
+L2B49	L2B48	L2B39	L2B38	L2B29
+4	3	2	1	0
+L2B28	L2B19	L2B18	L2B9	L2B8
+
+GC_CR_L2G_ERROR3
+*Addr: 0xe050; Type: RO
+63:3	2:0
+reserved	L2B63_ERR_CODE
+
+GC_CR_L2G_ERROR2
+Addr: 0xe048; Type: RO
+
+	62:60
+	L2B62_ERR_CODE
+59:57	56:54
+L2B61_ERR_CODE	L2B60_ERR_CODE
+53:51	50:48
+L2B59_ERR_CODE	L2B58_ERR_CODE
+47:45	44:42
+L2B57_ERR_CODE	L2B56_ERR_CODE
+41:39	38:36
+L2B55_ERR_CODE	L2B54_ERR_CODE
+35:33	32:30
+L2B53_ERR_CODE	L2B52_ERR_CODE
+29:27	26:24
+L2B51_ERR_CODE	L2B50_ERR_CODE
+23:21	20:18
+L2B49_ERR_CODE	L2B48_ERR_CODE
+17:15	14:12
+L2B47_ERR_CODE	L2B46_ERR_CODE
+11:9	8:6
+L2B45_ERR_CODE	L2B44_ERR_CODE
+5:3	2:0
+L2B43_ERR_CODE	L2B42_ERR_CODE
+
+GC_CR_L2G_ERROR1
+
+Addr: 0xe040; Type: RO
+
+	62:60
+	L2B41_ERR_CODE
+59:57	56:54
+L2B40_ERR_CODE	L2B39_ERR_CODE
+53:51	50:48
+L2B38_ERR_CODE	L2B37_ERR_CODE
+47:45	44:42
+L2B36_ERR_CODE	L2B35_ERR_CODE
+41:39	38:36
+L2B34_ERR_CODE	L2B33_ERR_CODE
+35:33	32:30
+L2B32_ERR_CODE	L2B31_ERR_CODE
+29:27	26:24
+L2B30_ERR_CODE	L2B29_ERR_CODE
+23:21	20:18
+L2B28_ERR_CODE	L2B27_ERR_CODE
+17:15	14:12
+L2B26_ERR_CODE	L2B25_ERR_CODE
+11:9	8:6
+L2B24_ERR_CODE	L2B23_ERR_CODE
+5:3	2:0
+L2B22_ERR_CODE	L2B21_ERR_CODE
+
+GC_CR_L2G_ERROR0
+
+Addr: 0xe038; Type: RO
+
+	62:60
+	L2B20_ERR_CODE
+59:57	56:54
+L2B19_ERR_CODE	L2B18_ERR_CODE
+53:51	50:48
+L2B17_ERR_CODE	L2B16_ERR_CODE
+47:45	44:42
+L2B15_ERR_CODE	L2B14_ERR_CODE
+41:39	38:36
+L2B13_ERR_CODE	L2B12_ERR_CODE
+35:33	32:30
+L2B11_ERR_CODE	L2B10_ERR_CODE
+29:27	26:24
+L2B9_ERR_CODE	L2B8_ERR_CODE
+23:21	20:18
+L2B7_ERR_CODE	L2B6_ERR_CODE
+17:15	14:12
+L2B5_ERR_CODE	L2B4_ERR_CODE
+11:9	8:6
+L2B3_ERR_CODE	L2B2_ERR_CODE
+5:3	2:0
+L2B1_ERR_CODE	L2B0_ERR_CODE
+
+
+GC_CR_L2_FUNCTION_ENABLE
+Addr: 0xe058; Type: RW
+63:6	7:4	3:2	1	0
+Reversed	ddr_capacity	hash_mode	bypass_mode	MEM_SCHEDULER
+
+ddr_capacity: 
+0b000:  2Gb, the row id is 13 bits
+0b001:  3Gb,4Gb, the row id is 14 bits
+0b010:  6Gb, 8Gb, the row id is 15 bits
+0b011:  12Gb, 16Gb, row id is 16 bits.
+0b100:  24Gb, 32Gb, the row id is 17bit.
+Others: illegal configuration
+
+bypass_mode:
+1: override the cache policy to 1.
+0: the cache policy is derived from axcache 
+
+mem_scheduler:
+1: enable memory scheduler
+0: disable memory scheduler, if disable, bank doesn¡¯t issue any request to memory scheduler.
+
+Hash_mode:
+0x0: No hash
+0x1: PVR hash
+0x2: Configurable hash
+0x3: PVR BG hash
+GC_CR_L2_MEM_SCHED_COL_OFFSET
+Addr: 0xe060 Type: RW
+63:61	60:56	52:48
+reserved	column_id_bit7	column_id_bit6
+44:40	36:32	28:24
+column_id_bit5	column_id_bit4	column_id_bit3
+20:16	12:8	4:0
+column_id_bit2	column_id_bit1	column_id_bit0
+
+GC_CR_L2_MEM_SCHED_BANK_OFFSET
+Addr:  0xe068, Type: RW
+36:32	28:24	20:16	12:8	4:0
+bank_id_bit4	bank_id_bit3	bank_id_bit2	bank_id_bit1	bank_id_bit0
+
+ddr_bank[0] = pa[bank_id_bit0];
+Any bit of PA can only be pointed once by either row offset or bank offset. It is illegal to assign multiple bank offsets multiple row offsets to the same position of PA.
+GC_CR_L2_MEM_SCHED_ROW_PARTI
+Addr: 0xe070, Type: RW
+60:56	52:48	44:40	36:32
+row_id_bit7	row_id_bit6	row_id_bit5	row_id_bit4
+28:24	20:16	12:8	4:0
+row_id_bit3	row_id_bit2	row_id_bit1	row_id_bit0
+Any bit of PA can only be pointed once by either row offset or bank offset. It is illegal to assign multiple bank offsets multiple row offsets to the same position of PA.
+
+GC_CR_L2_MEM_SCHED_ROW_PARTII
+Addr: 0xe078, Type: RW
+60:56	52:48	44:40	36:32
+row_id_bit15	row_id_bit14	row_id_bit13	row_id_bit12
+28:24	20:16	12:8	4:0
+row_id_bit11	row_id_bit10	row_id_bit9	row_id_bit8
+
+Any bit of PA can only be pointed once by either row offset or bank offset. It is illegal to assign multiple bank offsets multiple row offsets to the same position of PA.
+
+GC_CR_L2_MEM_SCHED_ROW_PARTIII
+Addr: 0xe080, Type: RW
+63:13	12:8	4:0
+reserved	row_id_bit17	row_id_bit16
+
+Any bit of PA can only be pointed once by either row offset or bank offset. It is illegal to assign multiple bank offsets multiple row offsets to the same position of PA.
+
+GC_CR_DDR_HASH_CONFIG_REG0
+Addr: 0xe088, Type: RW
+63:48	47:44	43:40	39:36	35:32	31:28
+reserved	Row id bit 11	Row id bit 10	Row id bit 9	Row id bit 8	Row id bit 7
+
+27:24	23:20	19:16	15:12	11:8	7:4	3:0
+Row id bit 6	Row id bit 5	Row id bit 4	Row id bit 3	Row id bit 2	Row id bit 1	Row id bit 0
+GC_CR_DDR_HASH_CONFIG_REG1
+Addr: 0xe090, Type: RW
+63:48	47:44	43:40	39:36	35:32	31:28
+reserved	Row id bit 23	Row id bit 22	Row id bit 21	Row id bit 20	Row id bit 19
+
+27:24	23:20	19:16	15:12	11:8	7:4	3:0
+Row id bit 18	Row id bit 17	Row id bit 16	Row id bit 15	Row id bit 14	Row id bit 13	Row id bit 12
+
+0 <= Row id bit < 9
+5 Design Constraint
+5.1 The arid/awid shall be unique before return response
+5.2 All transactions cannot across 2Kbit address boundary.
+5.3 All blen of the narrow transfers are fixed to 0.
+5.4 NOC cann¡¯t issue exclusive transactions
+5.5 All atomic transactions must be compatible to AXI Extended Atomic transactions
+5.6 NOC must issue all the write data to slv, then switch to another slave
+5.7 Atomic store is not supported. L2 supports atomic load, atomic swap, atomic compare
+5.8 NOC must support read return interleave at L2 side.
+
+
+6 Interface
+Parameters
+AXI instruction encoding
+Instruction	Description
+AXI_RD	Read cacheline data or DDR data and return to NOC
+AXI_WR	Write data to cacheline or DDR
+AXI_AA	Perform atomic operation on cacheline 
+CFG_INVALID	Invalid all cachelines without flushing dirty cachelines to DDR. After invalidation, L2 bank is empty.
+CFG_FLUSH	Flush all dirty cachelines to DDR. The partial cachelines will be flushed and invalidated. After flush, all the valid cachelines in L2 is clean.
+CFG_FLUSH_INVALID	Flush all dirty/partial cacheline and invalid all clean cachelines. 
+CFG_REDUCE_PERSIST	Reduce all unreferenced cacheline persistence in a time window
+CFG_RST_PERSIST	Reset all cacheline persistence
+
+Cacheline Instruction encoding
+Name	Encoding	Description
+RD	0x0	Read cacheline and return data to AXI5
+The initial mask must be asserted when the instruction is decoded in RCTRL.
+WR	0x1	Write cacheline. 
+The initial mask can be 0 when the instruction is decoded in RCTRL.
+when the initial mask is 0, the instruction shall set the initial mask to 1 and initial mask ram.
+AA	0x2	Read cacheline data and modify data then write to cacheline.
+The initial mask must be asserted when the instruction is decoded in RCTRL.
+FLUSH	0x4	Readout cacheline data to NSP bus.
+All byte mask shall be cleared. The initial mask keeps unchanged.
+The initial mask must be asserted when the instruction is decoded in RCTRL.
+WB	0x5	Readout cacheline data to NSP bus.
+The initial mask must be asserted when the instruction is decoded in RCTRL.
+The initial mask must be cleared when instruction is decoded.
+WB_WR	0x6	Fetch data from IWDB and merge the write data with cacheline data and flush to DDR.
+- sector initial mask is 0, doesnt read mask ram and data ram.
+- initial mask is 1, read mask ram and data ram
+PREFETCH	0x7	This special instruction tell ISCHED to wait for the linefill completion. If any request want to access the data, it must wait in ISCHED. After linefill completion, the instruction is cleared.
+This instruction is used for linefill.
+
+7 Open Issues
+7.1 Bank only support narrow transfer with blen == 0. 
+7.2 IWDB depth is limited to parameter IWDB_DEPTH. Write transactions with blen greater than IWDB_DEPTH is not accepted by bank if support narrow transfer with blen >= IWDB_DEPTH.
+7.3 How software know the CFI is finished? Track the CFI status in configure register or read idle status. 
+If read idle status, the idle shall be accurate. The idle signal cannt be registered due to timing issue.
+
+8 Hardware Architecture Description
+
+8.1 ALIGN 
+8.1.1 Function description
+1.	Split AXI request to cache access and buffer mode access, generate independent interface.
+2.	assign IWDB index for write/atomic operation, send index to downstream with request interface. Store assigned index in a FIFO, pop FIFO after receive data from AXI-W channel, then send write data to IWDB and using assigned index as address of IWDB.
+3.	Process CFI command, receive CFI request from configure register and insert it to TagCtrl interface, don¡¯t the subsequence request.
+4.	Convert all request to bus width alignment, output burst size is fixed value 64Byte, output burst length depend on request burst length and support up to 4 bursts.
+5.	Generate write response after received AW request and corresponding data.
+6.	Generate persistence update instruction according configure register.
+
+Buffer mode process
+The Buffer Mode has dedicated physical address space for GP3. The input request address range of L2 is buffer mode space add DDR space. The data in Buffer Space not write to DDR, not invalidate, not Flush.
+If the request address in the range of {buffer_mode_base_addr, buffer_mode_addr+buffer_size}, it will be mapped into the buffer mode area before L2. All L2 banks using the same buffer mode space and don¡¯t care the Bank ID. The buffer mode address received by L2 is offset address, the buffer mode base address has been subtracted, is_buffer_mode flag in AXI.axuser interface indicate this a buffer mode request.
+Software need to read buffer mode after write it, otherwise the read return data is invalid.
+If some banks are broken, reduce buffer mode space and jump the broken bank, the remaining buffer mode space should be evenly distributed to different banks, the upstream need to guarantee this, see ¡°Redundancy¡± section for detailed description.
+
+
+Write Response
+The align can return write response directly after receive write request and write data, send the request to TagCtrl on align_tagctrl interface, doesn¡¯t need to wait the write data do cacheline or DDR completed, don¡¯t care it is cacheable write or bypass (uncacheable) write operation. TagCtrl need to handle the data hazard after align return write response to upstream. Align return write response in order.
+
+Read Data Arbitration
+The ISCHED need to make sure the data within one cacheline will be distribute to the same RCTRL, so for one request from align to TagCtrl, it is accesses the same RCTRL always. RCTRL need to set the last flag if it is return the all data required.
+For the AXI request not cross cacheline, the align need to select the returned data from multi RCTRL with RR arbitration, but return the dada of same transaction as soon as possible.
+For bypass read miss cacheline, the read returned data from the ROB directly, not through the RCTRL, the align execute the arbitrate between read return data from multi RCTRL and the ROB with RR strategy follow the rule description as above.
+Atomic Data Format
+The align will write data and STRB to IWDB for write and atomic request. The data format in IWDB is show as table below. L2 need to support atomic CAS16 byte for PCIE.
+operation	data format
+write	{strb[512+:32], data[0+:512]}
+atomic	{atomic_swap[535+:1], atomic_size[533+:2], atomic_op[528+:5], dword_active[512+:16], data[0+:512]}
+
+Get atomic_swap from AXI.awuser. atomic_swap=0 indicates the compare data in low-bit position and swap data in high-bit position, atomic_swap=1 indicates the compare data in high-bit position and swap data in low-bit position. Wrap boundary is double of atomic size for compare and swap, 8-byte warp boundary for atomic 32, 16-byte wrap boundary for atomic 64, 32-byte wrap boundary for atomic 128. Ignore atomic_swap for not CAS operation, AXI write strobe indicate the valid data position. There are some examples are shown as table below.
+atomic information	operand data
+atomic 32 compare and swap
+atomic_swap=0, wstrb=¡¯hFF	compare data = wdata[0+:32]
+swap data = wdata[32+:32]
+atomic 32 compare and swap
+atomic_swap=1, wstrb=¡¯hFF	compare data = wdata[32+:32]
+swap data = wdata[0+:32]
+atomic 64 compare and swap
+atomic_swap=1, wstrb=¡¯hFFFF_0000	compare data = wdata[192+:64]
+swap data = wdata[128+:64]
+
+Get atomic size from AXI.awuser bit. The encode of atomic_size is show as table below.
+atomic size	encode
+atomic 32	¡®b00
+atomic 64	¡®b01
+atomic 128, PCIE&CAS atomic only	¡®b10
+
+
+Get atomic operation from AXI.awatop, AXI.awuser.extended_atomic_opcode, AXI.awuser.is_fp32. The encode of atomic_op is show as table below.
+atomic operation	atomic opcode	Description
+AA_OP_ADD	¡®h0_0	Unsigned Addition: 
+memory(addr) = memory(addr) + operand_a
+dword_active = 1 indicate operand_a.	
+AA_OP_SUB	¡®h0_1	Unsigned Subtraction:
+memory(addr) = memory(addr) - operand_a
+AA_OP_XCHG	¡®h0_2	Exchange: memory(addr) = operand_a, AXI atomic swap.
+AA_OP_CMPXCHG	¡®h0_3	Compare-Exchange, also compare and swap or AXI atomic compare: if memory(addr) = operand_a then memory(addr) = operand_b
+AA_OP_UMIN	¡®h0_4	Unsigned Minimum: if memory(addr) > operand_a then memory(addr) = operand_a
+AA_OP_IMIN	¡®h0_5	Signed Minimum, AXI atomic SMIN: if memory(addr) > operand_a then memory(addr) = operand_a
+AA_OP_UMAX	¡®h0_6	Unsigned Maximum: if memory(addr) < operand_a then memory(addr) = operand_a
+AA_OP_IMAX	¡®h0_7	Signed Maximum, AXI atomic SMAX: if memory(addr) < operand_a then memory(addr) = operand_a
+AA_OP_AND	¡®h0_8	Bitwise AND: 
+memory(addr) = memory(addr) AND operand_a
+AA_OP_OR	¡®h0_9	Bitwise OR: 
+memory(addr) = memory(addr) OR operand_a
+AA_OP_XOR	¡®h0_A	Bitwise XOR, AXI atomic EOR (exclusive OR):
+memory(addr) = memory(addr) XOR operand_a
+		
+AA_OP_FADD	¡®h1_0	single precision float-point Addition:
+memory(addr) = memory(addr) + operand_a
+AA_OP_FSUB	¡®h1_1	single precision float-point Subtraction:
+memory(addr) = memory(addr) - operand_a
+AA_OP_FMIN	¡®h1_5	single precision float-point Minimum: if memory(addr) > operand_a then memory(addr) = operand_a
+AA_OP_FMAX	¡®h1_7	single precision float-point Maximum: if memory(addr) > operand_a then memory(addr) = operand_a
+AA_OP_ FCMPXCHG	¡®h1_3	single precision float-point compare and swap or AXI atomic compare: if memory(addr) = operand_a then memory(addr) = operand_b
+
+Compress each 4-bit AXI.WSTRB to 1-bit dword_active by the follow rule, then don¡¯t need to increase the width of IWDB for atomic operation.
+dword_active[i] = &wtrb[4*i +: 4], (0<=i<16)
+
+For atomic operands, the corresponding write strobe must be a continuous sequence of 1, the others write strobe is illegal.
+atomic operation	illegal write strobe
+atomic 32, not CAS	(&wstrb[i*4+:4]!=1) && (|wstrb[i*4+:4]==1), Not the continuous 4-bit 1
+atomic 64, not CAS	(&wstrb[i*8+:8]!=1) && (|wstrb[i*8+:8]==1), Not the continuous 8-bit 1
+atomic 32, CAS	(&wstrb[i*8+:8]!=1) && (|wstrb[i*8+:8]==1), Not the continuous 8-bit 1
+atomic 64, CAS	(&wstrb[i*16+:16]!=1) && (|wstrb[i*16+:16]==1), Not the continuous 16-bit 1
+atomic 128, CAS	(&wstrb[i*32+:32]!=1) && (|wstrb[i*32+:32]==1), Not the continuous 32-bit 1
+
+CFI Process
+The align need to generate CFI command to TagCtrl after received CFI command from software though configure register.
+The align will insert a CFI instruction on align_cmu interface after receive CFI request, then the align can process the subsequence request as normal.
+CFI operation Flow:
+1.	Set GC_CR_L2_CFI_OPERATION register, indicate this is invalidate only, flush only or flush and invalidate.
+2.	Set GC_CR_L2_CFI_TRIGGER trigger hardware starts CFI.
+3.	Hardware set GC_CR_L2_CFI_COMPLETE after CFI complete, driver Polling GC_CR_L2_CFI_COMPLETE until CFI complete.
+4.	Set GC_CR_L2_CFI_COMPLETE_CLR clear CFI complete flag. CFI operation done.
+
+
+Persistence Update
+The L2 support two modes to update persistence value within TAG RAM by configure register.
+?	Configure GC_CR_L2_PERSIST_REDUCE_ENABLE register, reduce the persistence value if the cacheline not accessed within the timing window, generate CFG_REDUCE_PERSIST instruction on align_cmu interface.
+?	Configure GC_CR_L2_PERSIST_CLR_ALL register, reset all persistence value within TAG RAM, generate CFG_RST_PERSIST instruction on align_cmu interface.
+Note: All cacheline share the same timing window. The counter will increase after system reset release, roll back and reduce persistence value if counter equal to threshold. The persistence decreases once after twice of timing window in the worst case.
+ 
+The align can¡¯t reduce persistence value exactly, the real timing window is {threshold, 2*threshold-1}.
+If clock is disabled, this timing window counter remains unchanged, and the timing window reduce persistence value is indeterminate in this case.
+Insert command priority: CFG_CFI>CFG_RST_PERSIST>CFG_REDUCE_PERSIST >RR(AXI RD/WR request).
+
+8.1.2 Hardware description
+ 
+Figure 20 ALIGN microarchitecture
+
+IWDB Index Assignment
+The align need to allocate IWDB index for write and atomic request. After receive write command, the align allocate IWDB index for this request according write burst length. Push allocated IWDB index, burst length and index offset to index FIFO, pop index FIFO after received write data and write data to IWDB according the information in index FIFO. Pop index FIFO once for each write last transaction. The IWDB will make sure the data write to SRAM then can be read.
+Index FIFO data encode
+The align will compress the original AXI write strobe, then send the compressed dword_active and dword_partial to IWDB.
+
+Index FIFO data encode
+Data	Description
+[0 +: IWDB_DEPTH_BITS], IWDB index	data index within IWDB
+[ +: AXI_AWLEN_WIDTH], burst length	0: burst 1
+1: burst 2
+remove awlen, increase IWDB index until write last
+[ +: 2]	atomic_size
+[ +: 5]	atomic_op
+[ +: 1]	atomic_wrap
+[ +: 1]	is_atomic_req
+
+Write Response
+The align can generate and return write response to upstream directly after received write command and write data. It is early written response always.
+
+Buffer Mode
+There is 1-bit flag at AXI.axuser interface indicate this is a buffer mode request or not. Physical address = {BankId[5:0],WayId[1:0],SetId[6:0],[7:0]}
+buffer mode percentage	cacheline address	Offset Address	Comment
+25%	set	request_addr[14:8]	0~127
+	way	request_addr[16:15]+6	L2 add offset 6 get final way_id, request_addr[16] always is 0.
+	beat	request_addr[7:6]	512-bit alignment
+50%	set	request_addr[14:8]	0~127
+	way	request_addr[16:15]+4	L2 add offset 4 get final way_id
+	beat	request_addr[7:6]	512-bit alignment
+
+8.2 TagCtrl
+8.2.1 Function Description
+ 
+Figure 21 TagCtrl Microarchitecture
+8.2.1.1 CFI/Persistence unroll
+L2 cache supports coarse CFI operations, such as Flush, Flush Invalidate and Invalidate. Invalidate is generated when reset or register configuration. This instruction will unroll all set and invalidate all cachelines no matter what the cacheline status is. This instruction is used to clear the random value in tag ram when reset. 
+
+
+For other instructions like Flush, FlushInvalidate, they are generated by register configuration. When a CFI is generated, the instruction will be issued to perform lookup. Only the valid and dirty cacheline will be evicted. CFI will clear valid and beat_dirty_mask field.
+
+Table 8 Cacheline update under CFI and persistence operation
+	FLUSH	FLUSH_INVALID	INVALID	REDUCE_PERSIST	RST_PERSIST
+valid	no[1]	clear	clear	no	no
+beat_dirty_mask	clear	clear	clear	no	no
+partial	clear[1]	clear	clear	no	no
+persistence	no	no	clear	reduce [4]	clear
+addr	no	no	clear	no	no
+access_counter	no	no	No	no	no
+initial_mask	no	no[2]	no[3]	no	no
+touched_mask	no	no	clear	clear	clear
+byte_mask	yes	no	clear	no	no
+data	no	no	clear	no	no
+
+[1]: Partial cacheline will be invalidated when flush. These cachelines are written back to memory rather than flushed to memory because there is not partial but clean cacheline status.
+
+[2]	: flush invalid doesn¡¯t issue clear initial mask pulse to RCTRL when hit a clean cacheline. For dirty cacheline, the initial mask is cleared because flush invalid will issue WB instruction to ISCHED. WB instruction always clear initial mask. 
+
+[3]	: invalid doesn¡¯t clear initial mask. After invalidation, all cacheline is invalid. Any request allocates cacheline will issue clear initial mask to RCTRL. 
+
+[4]: reduce persistence only when touched_mask is 0. 
+
+When dirty cacheline is flushed, the cacheline will be a clean cacheline. An entry is allocated in inflight writeback buffer If any request hit the cacheline, cacheline instruction will be generated and issued to ISCHED. It is impossible to be replaced when flush is inflight. 
+
+When the CFI is ongoing, other instructions stall on the align-TagCtrl interface. 
+CFI cannot be executed when the lookup stages and overflow FIFO and hazard table is not empty.
+
+?	The touched_mask is set to 0 when cacheline is allocated. This behavior assumes that the cacheline will be referenced in current time window. If not referenced, the persistence value decreases and touched_mask is cleared when execute REDUCE_PERSIT.
+?	A Counter is used to track pending write request before CFI operation and triggered by CFI operations. Any write response from NSP is going to decrease the counter. Only when the counter is zero, CFI complete can be issued to regbank.
+?	The next CFI operation can be issued only when the previous CFI is finished.
+
+8.2.1.2 Forwarding Pipeline
+Table 9 Cacheline Tag Field
+Name	scope	Description
+plru_bits[6:0]	8 cachelines	Points to the least recently used cacheline. The plru bits are updated when cacheline are hit or replaced. Bypass request that doesn¡¯t hit will not update the PLRU.
+valid	sector	valid [1:0] == 00 means the cacheline is invalid.
+|valid [1:0] == 1 means the cacheline is valid.
+valid [0] == 1 means sector 0 is valid
+valid [1] == 1 means sector 1 is valid.
+beat_dirty_mask	beat	beat mask. Each bit is associated with 512 bits in data sram. It means there are dirty bytes in 512 bits. When evicted, the dirty bytes shall be flushed to DDR.
+partial	beat	Indicate the sector if there are invalid bytes. When cache write allocate cacheline, the partial bit is set. Only when read/atomic hit the partial cacheline, the partial bit can be cleared.
+addr	cacheline	Address tag field
+persistence	cacheline	persistence level. Indicates how long the cacheline will stay in L2 cache. It only influences the replace process. A cacheline with higher persistence has the lower priority to be replaced.
+access_counter	cacheline	Each access_counter indicates the number of inflight instructions on cacheline
+
+?	access_counter decreases when instructions are completed and increase when cacheline instruction is issued to ISCHED. it is implemented in flops.
+?	The pipeline is stalled when the access_counter reached the maximum value and the request wants to increase the counter.
+
+In TagCtrl, stage 2 needs to know 8 cacheline status as shown in the above Table 6. 
+
+In TagCtrl, request has three sources: align, hazard table, overflow FIFO.
+
+The sources have the following priority:
+?	overflow FIFO: when overflow FIFO has request to process, align interface shall be stalled until FIFO is empty. The request in overflow FIFO can be pulled out when the hazard table is cleared.
+?	 hazard table: hazard table request has priority when overflow FIFO has request to handle.
+?	hazard table: hazard table always has higher priority than align request.
+?	align: the lowest priority
+
+In TagCtrl, the first thing is to read TagRam data. TagRam is a dual-port RAM and can provide read and write per cycle. In theory, the pipeline cannot be stalled by read and write ram conflict. But dual-port RAM can¡¯t be written and read on the same address. Therefore, we provide a forwarding path to avoid read and write on same address and achieve full bandwidth. 
+
+ 
+Figure 22 Forwarding path in TagRam
+The full pipeline has four stages.
+
+In stage 0, address is generated to access the tag SRAM. Forward stage 3 data to stage 1 when address is equal. When stage 0 is stalled, stage 0 cannot read TagRam. The forwarding path doesn¡¯t work.
+
+In stage 1, the SRAM data is readout. When the pipeline is stalled, the SRAM output data shall be registered to avoid the ram output changes. Also, the forwarding data from stage 2 or stage 3 shall also be registered when stage 1 is stalled.
+
+The data registered by stage 2 has 4 sources:
+?	forwarding data from stage 2 has the highest priority
+?	forwarding data from stage 3 has the second priority
+?	stalled data has the third priority
+?	stage 1 data has the lowest priority
+
+In stage 2, the readout data from pipeline is always the newest. If not, the function doesn¡¯t work. The readout data is shown in Table 1 Cacheline tag field. 
+
+AXI request performs the lookup and allocate cacheline. The lookup result is issued to MEM_IF. It is possible that lookup result may trigger two transactions to access DDR. For example, cache read miss and replace dirty cacheline. Bank issues write request to DDR first. Then issue read transaction to DDR.
+
+Dependency shall be taken care. If some request needs to be issued to ISCHED and MEMIF at the same time, TagCtrl must guarantee request is issued to ISCHED first, then issued to MEMIF or issued to ISCHED and MEMIF at the same time.
+
+For example: 
+?	Read miss should issue request to ISCHED and MEMIF. If ISCHED is full, the ready is de-asserted, request can¡¯t be issued to MEMIF. If ISCHED is ready, request can be issued to MEMIF.
+
+In stage 3, lookup result will change the status of cacheline and need to write to TagRam. It is possible that the pending write data is needed by stage 1 or stage 2.
+
+Table 10 Forwarding data between different stages
+	Stage0	Stage 1	Stage 2	n_stage3	Stage 3
+Stage 0	-	Ignore	Ignore	Ignore	Forward
+Stage 1	-	-	Ignore	Forward	Forward
+Stage 2	-	-	-	-	-
+Stage 3	-	-	-		-
+
+The first row is the data that need to be forwarded in stage 0 to stage 3. The first column is the data that need forwarding data from stage 0 to stage 3.
+
+stage 0 vs stage 3: when stage 3 hold the newest data, the stage 3 data will be forwarded to stage 0 and registered.
+stage 0 vs stage 2: don¡¯t care this case. If newest data will be pushed to stage 3, the request is going to stage 2. It can be solved by stage 1 vs stage 3 hazard.
+stage 1 vs stage 3: when stage 3 hold the newest data and stage hold the data from TagRam, forward stage 3 data to stage 1. while stage 1 is stalled, the data is registered.
+stage 1 vs stage 2: when stage 2 generates the newest data, and stage need to use the newest data, forward the stage 2 data to stage 1.
+stage 2 vs stage 3: when stage 2 and stage 3 access the same address, stage 2 and stage 3 should has the same value.
+
+
+
+8.2.1.3 Hit Test
+Hazard check
+To improve performance, some special case will be treated as hazard and stall lookup pipeline.
+
+- Bypass/cache read hit inflight partial cacheline (access_counter != 0)
+The partial bit in an inflight partial cacheline maybe inaccurate. Any read transaction hit the cacheline may trigger unnecessary linefill. Push the read transaction into hazard table or stall the pipeline when hit inflight partial cacheline. When all the inflight requests on the cacheline are executed, the read transaction in hazard table can be poped. 
+This hazard is removed because RCTRL can solve this hazard. After remove this hazard, it is possible that linefill and write occurs on RCTRL input port at the same time. If linefill comes, RCTRL just write data to cacheline. If write comes first, linefill should read mask ram first, then write data on invalid bytes.
+
+- Bypass write hit inflight dirty/partial cacheline
+Bypass write is always visible to DDR. Once bypass write hit a dirty cacheline, bank should merge bypass write data with cacheline data. If there are pending request on the cacheline, bank should wait for previous request complete and merge the cacheline data with bypass write data. This scene is treated as hazard because bypass write is asynchronous with other request. It is possible that the bypass write may merge older data when this scene is not treated as hazard.   
+Update cacheline
+Access one sector
+
+Table 11 Update Tag Field When Access One sector
+operation 	policy	state	memif_instr	cacheline instr	linefill_waiting	wb_valid	plru_bits	beat_dirty_mask	partial	valid	access_counter	wb_entry	initial mask
+AXI_RD	0	miss on dirty/partial	LF	RD	1	1	update	clr	clr	1	+1	allocate	-
+		miss on clean/invalid	LF	RD	1	0	update	clr	clr	1	+1	unchanged	clr
+		clean	-	RD	0	0	update	unchanged	clr	1	+1	unchanged	-
+		partial	LF	RD	1	0	update	unchanged	clr	1	+1	unchanged	-
+		dirty	-	RD	0	0	update	unchanged	clr	1	+1	unchanged	-
+	1	miss 	BRD	-	0	0	unchanged	-	-	0	-	unchanged	-
+		clean	-	RD	0	0	update	unchanged	clr	1	+1	unchanged	-
+		partial	LF	RD	1	0	update	unchanged	clr	1	+1	unchanged	-
+		dirty	-	RD	0	0	update	unchanged	clr	1	+1	unchanged	-
+AXI_WR	0	miss on dirty/partial	NOPE	WR	0	1	update	update	1	1	+1	allocate	-
+		miss on clean/invalid	-	WR	0	0	update	update	1	1	+1	unchanged	clr
+		clean	-	WR	0	0	update	update	0	1	+1	unchanged	-
+		partial	-	WR	0	0	update	update	1	1	+1	unchanged	-
+		dirty	-	WR	0	0	update	update	0	1	+1	unchanged	-
+	1	miss 	ST	WT	0	0	unchanged	-	-	0	-	unchanged	
+		clean	ST	WT	0	0	update	clr	clr	0	0	unchanged	-
+		partial	ST	WB_WR	0	0	update	clr	clr	0	0	allocate	-
+		dirty	ST	WB_WR	0	0	update	clr	clr	0	0	allocate	-
+AXI_AA	-	miss on dirty/partial	LF	AA	1	1	update	update	clr	1	+1	allocate	-
+		miss on clean/invalid	LF	AA	1	0	update	update	clr	1	+1	unchanged	clr
+		clean	-	AA	0	0	update	update	clr	1	+1	unchanged	-
+		partial	LF	AA	1	0	update	update	clr	1	+1	unchanged	-
+		dirty	-	AA	0	0	update	update	clr	1	+1	unchanged	-
+flush	-	clean	-	-	-	0	Unchanged	clr	clr	1	-	unchanged	-
+		partial	ST	WB 	0	0	Unchange	clr	clr	0	-	allocate	-
+		dirty	ST	FLUSH	0	0	Unchanged	clr	clr	1	-	allocate	-
+inval	-	clean	-	-	-	0	Clr	clr	 clr	0	-	   unchanged	-
+		partial	-	-	-	0	clr	clr	clr	0	-	unchanged	-
+		dirty	-	-	-	0	clr	clr	clr	0	-	unchanged	-
+flushinval	-	clean	-	-	-	0	Unchanged	clr	clr	0	-	unchanged	-
+		partial	ST	WB	-	0	Unchanged	clr	clr	0	-	allocate	-
+		dirty	ST	WB	-	0	Unchanged	clr	clr	0	-	allocate	-
+
+When the axi request access only a sector but prefetch size == 256B, the instruction issued to ISCHED is relative with another sector state.
+In some special case, two cacheline instructions may be issued to ISCHED. When the read/atomic transaction hit a clean/dirty sector and prefetch another sector while another sector is invalid or partial, a PREFETCH instruction is generated and issued to ISCHED to wait for the linefill completion. Then RD instruction is issued to ISCHED to readout SRAM.
+Access two sector:
+
+Table 12 Update Tag Field When Access Two Sectors
+operation 	policy	Sector 1	Sector 0	memif_instr	cacheline instr	linefill_waiting	plru_bits	Beat_dirty_mask	partial	valid	Access_cnt	wb_entry	memif	isched
+read	0	invalid	clean	LF	RD	2¡¯b10	Update	Unchanged	2¡¯b00	2¡¯b11	+1	Unchanged	Yes	Yes
+		invalid	partial	LF		2¡¯b11							Yes	
+		invalid	dirty	LF		2¡¯b10							Yes	
+		clean	invalid	LF		2¡¯b01							yes	
+		clean	clean	-		2¡¯b00							No	
+		clean	partial	LF		2¡¯b01							yes	
+		clean	dirty	-		2¡¯b00							no	
+		partial	invalid	LF		2¡¯b11							yes	
+		partial	clean	LF		2¡¯b10							yes	
+		partial	partial	LF		2¡¯b11							Yes	
+		partial	dirty	LF		2¡¯b10							Yes	
+		dirty	invalid	LF		2¡¯b01							Yes	
+		dirty	clean	-		2¡¯b00							No	
+		dirty	partial	LF		2¡¯b01							Yes	
+		dirty	dirty	-		2¡¯b00							no	
+	1	invalid	invalid	Is treated as miss. The behavior refers to Table 11
+
+		invalid	clean	Refer to policy to 0 because bypass read hit a cacheline is treated as cache read hit a cacheline.
+		invalid	partial	
+		invalid	dirty	
+		clean	invalid	
+		clean	clean	
+		clean	partial	
+		clean	dirty	
+		partial	invalid	
+		partial	clean	
+		partial	partial	
+		partial	dirty	
+		dirty	invalid	
+		dirty	clean	
+		dirty	partial	
+		dirty	dirty	
+write	0	invalid	invalid[1]	-	WR	-	Update	Update	Update	2¡¯b11	+1	Unchanged	No	yes
+		clean	-										No	Yes
+		partial	-										No	Yes
+		dirty	-										No	yes
+	1[2]	invalid	clean	ST	WT		Update	2¡¯b00	2¡¯b00	2¡¯b00	0	Unchanged	yes	no
+		invalid	partial		WB_WR							Allocate		
+		invalid	dirty		WB_WR							Allocate		
+		clean	invalid		WT							Unchanged		
+		clean	clean		WT							Unchanged		
+		clean	partial		WB_WR							allocate		
+		clean	dirty		WB_WR							allocate		
+		partial	invalid		WB_WR							allocate		
+		partial	clean		WB_WR							allocate		
+		partial	partial		WB_WR							allocate		
+		partial	dirty		WB_WR							allocate		
+		dirty	invalid		WB_WR							allocate		
+		dirty	clean		WB_WR							allocate		
+		dirty	partial		WB_WR							allocate		
+		dirty	dirty		WB_WR							allocate		
+aa	-[2]	invalid	clean	LF	AA	2¡¯b10	Update	Update	2¡¯b00	2¡¯b11	+1	Unchanged	Yes	yes
+		invalid	partial			2¡¯b11							Yes	
+		invalid	dirty			2¡¯b10							Yes	
+		clean	invalid			2¡¯b01							Yes	
+		clean	clean			2¡¯b00							No	
+		clean	partial			2¡¯b01							Yes	
+		clean	dirty			2¡¯b00							No	
+		partial	invalid			2¡¯b11							Yes	
+		partial	clean			2¡¯b10							Yes	
+		partial	partial			2¡¯b11							Yes	
+		partial	dirty			2¡¯b10							Yes	
+		dirty	invalid			2¡¯b01							Yes	
+		dirty	clean			2¡¯b00							No	
+		dirty	partial			2¡¯b01							Yes	
+		dirty	dirty			2¡¯b00							No	
+
+
+[1] for write operations, if miss, please refer to Table 11.
+[2] atomic operation doesn¡¯t care about cache policy. The abstraction behavior refers to Table 3.
+?
+
+ 
+8.2.1.4 Cacheline replacement
+PLRU algorithm is applied to select a cacheline to replace.  PLRU bits are stored in tag ram. Generally speaking, the plru bit will point to the last recently used cacheline. But the selection will be influenced by persistence value and access_counter. Cachelines has the following priority to perform replace:
+-	invalid cacheline
+-	persistence == 0 cachelines with access_counter == 0
+-	persistence == 1 cachelines with access_counter == 0
+-	persistence == 2 cachelines with access_counter == 0
+-	persistence == 3 cachelines with access_counter == 0
+
+cachelines with access_counter!= 0 cannot be replaced. 
+
+?	Replace dirty/partial cacheline, initial_mask is cleared by WB instruction.
+?	Replace clean cacheline, initial_mask is not cleared until it is allocated to another request.
+
+8.3 RCTRL
+Function Description
+Data RAM: 2RCTRL*512bit*4096depth.
+Dirty Mask RAM: 2RCTRL*128bit*2048depth, 1 entry per sector, data dirty mask, active high, byte granularity.
+Initial Mask: 2RCTRL*2048bit, 1 bit per sector, total 4096bit.
+
+The RCTRL is used to process the instruction from ISHCED, and linefill request from ROB. Access cacheline according different request, including update data, dirty mask and initial mask. Instruction process within RCTRL is show as table below.
+
+Instruction	Dirty Mask RAM	Data RAM	Initial Mask
+RD	-	read RAM and return to align (NOC)	-
+illegal if initial mask is 0
+WR	write original data mask if initial mask is 0.
+write 1, ignore 0 if initial mask is 1.	write data according data mask	set to 1 if initial mask is 0
+AA	write 1, ignore 0 according dword_active, if initial mask is 1.	read RAM and return to NOC(Align).
+then write atomic result according dword_active.	-
+illegal if initial mask is 0
+WB	read RAM and send to DDR	read RAM and send to DDR if initial_mask is 1.	clear
+FLUSH	read RAM and send to DDR, then write all 0	read RAM and send to DDR	-
+illegal if initial mask is 0
+WB_WR	read RAM, merge with the request write mask, then send to DDR	if initial_mask is 1:
+read RAM, merge with the request write data, request data overwrite the dirty data and then send to DDR
+if initial_mask is 0:
+don¡¯t read data RAM and mask RAM, send write data to WDC direct	clear
+Linefill	write all 0 if initial mask is 0.
+read RAM but no update if initial mask is 1.	if initial mask is 0:
+?	write data directly.
+if initial mask is 1:
+?	write data if dirty byte mask is 0.
+?	ignore data if dirty byte mask is 1. ignore all data if dirty byte mask is all 1.	set to 1 if initial mask is 0
+
+For valid cacheline, the data status is show as table below.
+TAG.Partial	Byte Dirty Mask	Data Status
+0	0	clean, data valid
+	1	dirty, data valid
+1	0	clean, data invalid, TagCtrl need to make sure don¡¯t RD the partial cacheline, must be read after linefill and clean partial.
+	1	dirty, data valid
+
+Hardware Description
+The RCTRL using the multi stages pipeline control the access of to RAM. The pipeline stage is shown as figure below.
+ 
+Each stage implements the different operation for different instruction, it is shown as table below.
+Step	Instruction	Operation
+stage 0	RD	read data RAM
+	WR	read dirty mask RAM if need check partial
+	AA	read data RAM
+	WB	read dirty mask and data RAM if initial_mask is 1
+	Flush	read dirty mask and data RAM
+	WB_WR	read dirty mask and data RAM if initial_mask is 1
+	Linefill	read dirty mask RAM if initial mask is 1
+stage 1	RD	hold RAM output data
+	WR	hold RAM output data if stage 0 read it
+	AA	hold RAM output data
+	WB	hold RAM output data
+	Flush	hold RAM output data
+	WB_WR	hold RAM output data
+	Linefill	hold RAM output data if stage 0 read it
+stage 2
+	RD	return data to align
+	WR	sync write data from ISCHED
+	AA	get request data from ISCHED, execute atomic operation. [1]
+	WB	sync write data from ISCHED, return data to WDC
+	Flush	return data to WDC
+	WB_WR	sync write data from ISCHED, return data to WDC
+	Linefill	update dirty mask if initial mask is 1
+	ALL	generate instruction done at this cycle for all operation
+stage 3 [2]	WR	write data RAM according write data and write strobe.
+if initial mask is 1, write dirty mask RAM per bit: 
+write 1 to dirty mask RAM if request write strobe is 1
+don¡¯t update dirty mask RAM if request write strobe is 0
+if initial mask is 0:
+write 1 to dirty mask RAM if request write strobe is 1
+write 0 to dirty mask RAM if request write strobe is 0
+	AA	write data RAM according atomic result
+write 1 to dirty mask RAM if atomic operation makes data update.
+	Flush	clear dirty mask to 0
+	Linefill	if initial mask is 1: write linefill data if dirty mask is 0, don¡¯t update mask
+if initial mask is 0: update dirty mask to 0 and write all linefill data to data RAM.
+Note:
+[1]: generate atomic result at current cycle for integer atomic request, generate atomic result at next cycle for FP atomic request, there is a bubble if current RD/AA need fp32 atomic result at previous cycle.
+[2]: actually, write data and mask RAM at stage 4 within spram_pipeline module.
+
+The RCTRL using forward to handle the data dependence and improve performance. The block diagram of stage and forward path is shown as figure below.
+ 
+All forward data paths for read and write operation are shown as table below. There are 5 forward data path and cover different read/write sequence.
+read	stage1 to stage0	forward data from stage3 to stage2
+	stage2 to stage0	forward data from stage3 to stage1
+write	stage3 to stage0	don¡¯t read RAM, forward data from stage4 to stage1
+if read and write access the different address, stall read operation
+	stage4 to stage1	forward data from write data buffer to stage1
+	stage4 to stage0	actually, forward data from stage5 (previous write data buffer out) to stage1
+The 5 forward data paths are show as table below.
+	stage0	stage1	stage2	stage3	stage4
+stage0	-	ignore [1]	ignore [2]	ignore [4]	forward [7]
+stage1	-	-	ignore [3]	forward (read) [5]	forward [8]
+stage2	-	-	-	forward (not fp32) [6]	forward (fp32) [9]
+stage3	-	-	-	-	-
+stage4	-	-	-	-	-
+Note:
+[1]: stage1 to stage0 is same as stage2 to stage1
+[2]: stage2 to stage0 is same as stage3 to stage1
+[3]: stage2 to stage1 is same as stage3 to stage2
+[4]: stage3 to stage0 is same as stage4 to stage1
+[5]: stage3 to stage1 forward, read to read only
+[6]: if read previous int atomic result, forward from write data, else forward from stage3 write data. Clear dirty mask when FLUSH operation, not forward write data at this case. There is no this case after add RAW hazard.
+[7]: actually, forward data from stage5 to stage1, forward data from previous write operation
+[8]: stage4 to stage1 is write to read forward only, forward data from write data buffer
+[9]: including previous FP32 atomic result or stage4 write data forward to stage2. There is no this case after add RAW hazard.
+
+Write Buffer
+Stage4 write SRAM and stage0 read SRAM win current design, write always has the high priority and execute first if read and write SRAM at the same cycle, this will cause pipeline stalling when read and write operation are interleaving frequently and reduce the utilization of SRAM.
+ 
+RCTRL need to add a write data buffer and adjust the priority of read and write to optimize performance.
+The behavior of writing data caching is similar to FIFO. Push the write request to data buffer and pop write request from data buffer if can execute SRAM write operation.
+ 
+There are some special cases as below:
+1.	write merge: if there is a request has the same address in write data buffer with the new write request, merge the write request, new write request overwrite before. Do not update write pointer of buffer at this case.
+2.	Pop priority: 
+a)	if write data buffer full, always pop write data buffer and write data to SRAM, stall read request
+b)	else execute the read request and push new write request to write data buffer
+c)	if no read request and write data buffer not empty, pop the write data buffer and write data to SRAM.
+3.	Forwarding: keep forwarding data path unchanged, for forward from stage 4 to stage 1, forward data from write buffer to read out, for forward from stage 4 to stage 0, save write data and forward to read out at next cycle. Forward data from stage 4 to stage 0 when all data bytes is written.
+
+FP32 Atomic ALU
+dword_active indicate the position of operand data, the data in cacheline at this position may be update for not CAS atomic after atomic is completed. For CAS atomic operations, after the atomic operation is completed, the data in the cacheline at the position corresponding compare data may be updated. For atomic request, return data is always origin data in cacheline.
+final_dword_active = dword_active for not CAS operation.
+final_dwrod_active= dword_acitve & (dword_active>>N) for CAS atomic and atomic_swap=0.
+final_dwrod_active= dword_acitve & (dword_active<<N) for CAS atomic and atomic_swap=1
+N=1 for CAS 32, N=2 for CAS 64, N=4 for CAS 128.
+atomic information	original dword_active	final dword_active
+CAS 32, atomic_swap=0	¡®b0011	¡®b0011&¡¯b0001=¡¯b0001
+CAS 32, atomic_swap=1	¡®b0011	¡®b0011&¡¯b0110=¡¯b0010
+CAS 64, atomic_swap=0	¡®b1111_0000	¡®b1111_0000&¡¯b0011_1100=¡¯b0011_0000
+CAS 128, atomic_swap=1	¡®b1111_1111	¡®b1111_1111&¡¯b1111_0000=¡¯b1111_0000
+
+The dword_active encode format is show as table below.
+atomic operation	dword_active	Example
+atomic 32, not CAS
+ignore atomic_swap	active high, execute atomic operation on the data if dword_active is 1.	¡®b1101_1001, execute atomic on dword 0,3,4,6,7
+atomic 64, not CAS
+ignore atomic_swap	must be two consecutive dword_active bits.	¡®b1100_0011, execute atomic on {dword1, 0}, {dword7, 6}
+atomic 32, CAS
+atomic_swap=0	must be 2-bits consecutive dword_active.
+compare data in LSB, swap data in MSB	¡®b0011:
+compare data = dword0
+swap data = dword1
+atomic 32, CAS
+atomic_swap=1	must be 2-bits consecutive dword_active.
+compare data in MSB, swap data in LSB	¡®b0011:
+compare data = dword1
+swap data = dword0
+atomic 64, CAS
+atomic_swap=0	must be 4-bits consecutive dword_active.
+compare data in LSB, swap data in MSB	¡®b1111_0000:
+compare data = {dword5, 4}
+swap data = {dword7, 6}
+atomic 128, CAS
+atomic_swap=1	must be 8-bits consecutive dword_active.
+compare data in LSB, swap data in MSB	¡®b1111_1111:
+compare data = {dword7, 6, 5, 4}
+swap data = {dword3, 2, 1, 0}
+
+See description about dword_active at SVN path 
+01.Documents\GP3\02.Tech\02.Architecture\03.Spec\GPU_Ordering_System_Design_CHS_xx.docx
+
+Execute atomic operation within aa_alu_wrap module, support atomic 32, atomic 64, atomic FP32, atomic compare 128.
+ 
+Get the operand_b by shift operand_a according dword_active within CAS boundary.
+For F32 atomic operation, rounding mode is RNE (Round to Nearest Even).
+For atomic MIN/MAX operation, if atomic result is same as data in cacheline, don¡¯t update byte dirty mask.
+For atomic CMPXCHG operation, update byte dirty mask if compare data match, even swap data is same as original data in cacheline.
+
+ 
+
+Atomic add special number
+¡Àinfinity: Sign=0 or 1, Exponent=2e-1 (all bit-1), Fraction =0;
+NAN: Exponent=2e-1 (all bit-1), Fraction ¡Ù0;
+Denormal: Exponent=0, Fraction ¡Ù0;
+
+FP32 ADD special value result is show as table below, for FP32 SUB operation, translate to [addr]+(-operand_a) and follow the table below.
+[addr]	Operand A	Result	Note
+normal	NAN	NAN(0x7FC00000)	[addr]+operand_a has the same result with operand_a+[addr]
++inf	-inf	NAN	
++inf	+inf	+inf(0x7F800000)	
+-inf	-inf	-inf(0xFF800000)	
+normal/ denormal	+inf	+inf	
+normal/ denormal	-inf	-inf	
+NAN	+/-inf
++/-denormal
+NAN	NAN	if any operand is NAN, result is NAN.
+-inf	NAN	NAN	
+denormal	normal	normal, set denormal as zero value	The different of denormal and normal data less than 23. FOP ISA instruction has 1-bit indicate flush denormal to zero value or not, atomic (DMA) instruction no this bit, always flush denormal to zero value, it is same as CUDA.
+denormal	denormal	+0.0f	if any one of [addr] and operand_a is positive value, ignore the value of [add] and operand_a.
+denormal	denormal	-0.0f	if and only if [addr] and operand_a are negative value, ignore the value of [add] and operand_a.
+normal	normal	+inf	result Exp=0xFF, mantissa =0
+two operands are positive value
+normal	normal	-inf	result Exp=0xFF, mantissa =0
+two operands are negative value
+normal	normal	+0.0f	two operands have the different sign bit, and the |positive| > |negative|
+result Exp=0x0, mantissa¡Ù0 (denormal)
+Note: flush denormal to zero value
+normal	normal	-0.0f	two operands have the different sign bit, and the |negative| > |positive|
+result Exp=0x0, mantissa¡Ù0 (denormal)
+Note: flush denormal to zero value
+
+FP32 special value compare result is show as table below.
+FP32 MIN
+[addr]	Operand A	Result	update
+NAN	NAN
+normal/denormal
++/-inf	NAN(0x7FC00000)	yes [1]
+normal/denormal
++/-inf	NAN	NAN(0x7FC00000)	yes
++inf	+inf	+inf(0x7F800000)	no [1]
+-inf	-inf	-inf(0xFF800000)	no
++inf	-inf	-inf	yes
+-inf	+inf	-inf	no
+normal/denormal	+inf	normal/ denormal	no
+normal/denormal	-inf	-inf	yes
++inf	normal/denormal	normal/ denormal	yes
+-inf	normal/denormal	-inf	no
+normal/denormal	normal/denormal	compare sign/exp/mantissa as normal	yes/no
+FP32 MAX.
+[addr]	Operand A	Result	update
+NAN	NAN
+normal/denormal
++/-inf	NAN(0x7FC00000)	yes [1]
+normal/denormal
++/-inf	NAN	NAN(0x7FC00000)	yes
++inf	+inf	+inf(0x7F800000)	no [1]
+-inf	-inf	-inf(0xFF800000)	no
++inf	-inf	+inf	no
+-inf	+inf	+inf	yes
+normal/denormal	+inf	+inf	yes
+normal/denormal	-inf	normal/denormal	no
++inf	normal/denormal	+inf	no
+-inf	normal/denormal	normal (is Operand A)	yes
+normal/denormal	normal/denormal	compare sign/exp/mantissa as normal	yes/no
+[1]: If result is True, update Operand A to memory address, else keep original data unchanged. The returned data is always the data in memory.
+FP32 compare and exchange (CMPXCHG) special value result is show as table below.
+rgx_cr_usc_lms_fp32_denormal_en = 1.
+[addr]	Operand A	Result	update
+NAN	NAN
+normal/denormal
++/-inf	not equal	no
+normal
++/-inf	NAN	not equal	no
+denormal	NAN	not equal, but flush [addr] to zero	yes
+denormal	normal
+denormal
++/-inf	flush input denormal data to zero then bitwise comparison.
+if not equal result=flushed([addr])
+if equal result=flushed(operand_b)	yes/no
+normal
+denormal
++/-inf	denormal	flush input denormal data to zero then bitwise comparison.
+if not equal result=flushed([addr])
+if equal result=flushed(operand_b)	yes/no
+normal
++/-inf	normal
++/-inf	bitwise comparison.
+if not equal result=[addr]
+if equal result= operand_b	yes/no
+rgx_cr_usc_lms_fp32_denormal_en = 0.
+[addr]	Operand A	Result	update
+NAN	NAN
+normal/denormal
++/-inf	not equal	no
+normal
+denormal
++/-inf	NAN	not equal	no
+normal
+denormal
++/-inf	normal
+denormal
++/-inf	bitwise comparison.
+if not equal result=[addr]
+if equal result= operand_b	yes/no
+
+
+For FP32 ADD/SUB operation, denormal data always flush to zero.
+For FP32 MIN/MAX/CMPXCHG operation, input denormal flushing controlled by configure register rgx_cr_usc_lms_fp32_denormal_en. 
+0: don¡¯t flush input denormal;
+1: flush input denormal to zero;
+rgx_cr_usc_lms_fp32_denormal_en just flush input denormal data for FP32 MIN/MAX operation, but atomic result always coming from the operand data. Example FP32 MIN atomic request, request data is denormal data 0x0000_1234, original data is 0x1234_5678, rgx_cr_usc_lms_fp32_denormal_en=1, then flush request denormal data to 0x0000_0000, and 0x0000_0000<0x1234_5678, atomic result is 0x0000_1234, not 0x0000_0000.
+
+Pseudo code:
+if (rgx_cr_usc_lms_fp32_denormal_en)
+  if(op==FP32_MIN)
+if(flush(op_a)<flush(op_b))
+  result=op_a;
+else
+  if(op==FP32_MIN)
+if(op_a<op_b)
+  result=op_a;
+	LMS	L2
+ADD/SUB F32	CR [1]	always flush
+MIN/MAX F32	CR	CR (don¡¯t flush result)
+CAS F32 (CMPXCHG)	CR	CR (flush result)
+[1]: CR = denormal flush controlled by configure register.
+
+
+
+ 
+8.4 ISCHED
+ 
+Figure 23 ISCHED Microarchitecture
+Function Description
+Isched provides a unified buffer to manage the order to access the same cacheline or sector. All request from TagCtrl will be pushed into a buffer in order. 
+Maintain the order of accessing same sector
+Four types of hazard such as RAR, RAW, WAW, WAR are all processed in order. For example,
+?	TagCtrl issues R0,R1,R2. These requests all access the same sector. Isched will output R0, R1, R2 in order.
+?	TagCtrl issues R0, W1, A2, R3. These request all access the same sector. Isched also output R0, W1, A2, R3 in order.
+?	If TagCtrl issues R0, R1, R3 and these request access different sectors. These request may be output out of order.
+Read request that hit on miss shall wait in ISCHED until linefill response return from RCTRL.
+Linefill v.s Writeback Hazard
+Read miss on dirty cacheline triggers linefill and writeback at the same time. Bank must guarantee writeback is always executed first, then linefill can be executed. TagCtrl issue read request to ISCHED with linefill_waiting[1:0] and wb_waiting. Linefill_waiting means the read request shall wait for linefill response from RCTRL. Wb_waiting means the request shall wait for the WB response from RCTRL. RCTRL returns either linefill response or WB response at a cycle. The order of linefill response and WB response is guaranteed by MEMIF. From Isched perspective, WB response always return first, then linefill response return.
+Prefetch 
+Request from TagCtrl accesses either sector 0/1 or both sectors. The information is derived from blen and addr. But a prefetch request will influence the calculation.
+?	A read request with blen == 0, start_beat = 0, prefetch = 1 miss in TagCtrl will be regarded as accessing two sectors because TagCtrl will issue read request to DDR and linefill two sectors.
+?	A read request with blen == 0, start_beat = 0, prefetch = 0 misses or hit in TagCtrl will be regarded as accessing sector 0.
+?	A request with blen == 1, start_beat == 2, prefetch == 1 hit sector 1 and miss sector 0 (sector 0 is invalid). The request is still regarded as accessing two sectors.
+Read request with prefetch potentially accesses two sectors. Prefetch doesn¡¯t affect if the request access two sectors. If the read request only accesses one sector and prefetch == 1, the request will be regarded as accessing two sectors when the other sector is invalid or partial.
+
+Split request
+The request stored in Ring buffer is a burst request. Before access cacheline data, ISCHED will split the request. Each request that issued to RCTRL is aligned to 512bit.
+Some special case shall be taken care. When receive WB_WR request, ISCHED sometimes transfer the request to WB request. For example
+?	A bypass write request with blen == 1, start_beat == 1, hit a dirty cacheline with valid[1:0] = 0b10, beat_dirty_mask[3:0] = 0b1100. Bank shall merge data in beat 1 and beat 2 with bypass write data and write to DDR. For beat 3, bank just readout the data and write to DDR. WB_WR request is splitted to WB_WR beat 1, WB_WR beat 2, WB beat 3.
+Fetch write data 
+WR/AA/WB_WR instructions will write data to sram. It need to fetch data from IWDB using iwdb_index. The request in sorting queue carries a start address. When the request is splited, the iwdb_index should recalculate.
+Hardware Description
+The diagram below shows the hardware architecture of the ISCHED. As described in the feature description above, ISCHED is responseble for the in-order output of requests sent by the TagCtrl in Ring buffer; arbitrating requests from TagCtrl, WDC and ALIGN, where requests from WDC such as WB/WB_WR/FLUSH have the highest priority; splitting requests to align sectors or cachelines into 512bit aligned requests in SPLIT; fetching write data from the IWDB, and not need to synchronize write commands with write data by lock buffer.
+
+ 
+
+Ring Buffer
+Ring buffer use the register to save the state bit, use the sram to save the sideband signal.
+The order of the requests is ensured using Wr_ptr and Rd_ptr, combined with a round robin mechanism.
+write pointer: the write pointer always points to the next entry to be written.
+read pointer: always points to the previous oldest valid entry. 
+Beside, ring buffer can output two request in one cycle, which are sent to different RCTRL.
+ 
+
+Wr_ptr and Rd_ptr
+Wr_ptr: when a request from TagCtrl comes in, the wr_ptr increase by 1 until it colides with the rd_ptr. It indicate that the ring buffer is full and can¡¯t receive more requests.
+Rd_ptr: the rd_ptr can move forward until status_valid of the next entry is pulled low. However, since the other reqeust, which don¡¯t need to wait the linefill, write back, can go forward first. This valid status bit of this entry will be pulled low before the valid bit of the oldest entry pointed to by the rd_ptr. After processing the oldest entry which is next entry of the rd_ptr, the rd_ptr jumps one entry in one cycle and stop at the entry finally, whose own status_valid is 0 and next entry¡¯s status_valid is 1. If the read pointer is equal to the wr_ptr, it is considered to have been full. But in fact, the ring buffer remain one entry, which isn¡¯t used.
+ 
+Entry issue
+This is related to the position of the rd_ptr.
+If the entry which is next entry of the rd_ptr, is in the waiting_linefill, waiting_wb state, the rd_ptr can¡¯t move.
+The entry which is not in waiting state, can be directly issue to the RCTRL. Its valid status bit will be desassert.
+Until the waiting state of the entry, which is next entry of the rd_ptr, is released, this entry has the highest priority to issue to the RCTRL.
+ 
+
+Waiting state release
+Linefill done:
+When rctrl_isched_port send linefill_done signal, the ring buffer lookup all entries, and tie the corresponding waiting_linefill bit to 0 according to the returned set, way, and sector_mask from RCTRL, because the linefill_waiting state base on sector granularity;
+Also, lookup the port request from TagCtrl. If the port request is also in this case, overwrite the waiting_linefill status to 0;
+waiting_WB release:
+The waiting_wb state base on cacheline granularity, so each entry only uses 1 bit to indicate the waiting status. Then when the WB completion signal comes back, lookup the set and way of all entries; also check the port request. If the port request is also in the waiting_wb status, overwrite it to 0;
+ 
+
+Hazard method
+When waiting status is equal to 0(lf waiting, wb waiting), the request will issue to RCTRL as the order from Tagctrl.
+Isched need to ensure the order between the request, which access the same sector, whatever the linefill or request own.
+When Tagctrl allocate a new cacheline for a request, it cause the linefll. Because of the prefetch size, the mask of linefill request issued by Tagctrl is maybe not the same as the request¡¯s sector mask.
+The subsequence request hit the the same cacheline, is called secondary hit, and will not be sign linefill waiting.
+According the mechanism of the Isched, the request, which not waiting, will be not block by ISCHED, issue to RCTRL in order. That means secondary hit request can overtake the miss request. That is not correct. So ISCHED need to base on the situation, merge the linefill waiting or wb waiting of the miss request to the secondary hit request. It ensure the order between the request which access same sector.
+
+?	Situation 1
+When request B and previous request A both access the same sector. But A remain linefill waiting status. Because request B is secondary hit this sector, Tagctrl issue the request B without linefill waiting. Isched need to ensure the order between these two request. So A¡¯s linefill status need to merge to B.
+Sector_mask 	linefill_waiting
+A 		1X				  11
+B		1X				  XX->11(merge by A¡¯s lf stauts)
+
+?	Situation 2
+When request B and request A access the same cacheline, but not the same sector. If request B¡¯s sector_mask and request A¡¯s linefill_waiting have not overlap, then B can issue by Isched before A.
+Sector_mask 	linefill_waiting
+A 		10				  10
+B		01				  0X
+
+?	Situation 3
+When request B and request A access the same cacheline, but not the same sector. If request B¡¯s sector_mask and request A¡¯s linefill_waiting have overlap, then B can¡¯t issue by Isched before A. A¡¯s linefill status need to merge to B.
+Sector_mask 	linefill_waiting
+A 		10				  01
+B		01				  X0 -> X1(merge by A¡¯s lf stauts)
+
+X means 0 or 1.
+
+When linefill done flag from RCTRL comes, all corresponding lf status(same set, way, sector mask) of the entry in Ring buffer will be clear. After the linefill waiting clear, the request will be issue to RCTRL inorder as Tagctrl¡¯s order.
+WB waiting is similar as the linefill waiting. WB waiting status¡¯s granularity is cacheline. So if two request access the same cacheline, directly merge the first request¡¯s wb waiting status to the second request.
+
+
+Arbiter & Split
+Arbiter
+There are three input for arbiter: ROB, buffer mode, WB channel.
+WB channel has highest priority.
+ROB and Buffer mode reqeust  are polled to output by round robin.
+
+Split
+1. Request Splitting
+?	Input Alignment:
+Incoming requests are aligned to 1024-bit or 2048-bit, but the RCTRL only supports 512-bit alignment.
+Therefore, each request must be split into multiple 512-bit request.
+?	Number of Splits:
+Determined by the value of blen and beat_dirty_mask.
+?	Marking the Last request:
+After all splits are processed, the last signal is asserted to indicate the final request of the request.
+?	
+WB_WR split:
+If the instruction is WB_WR, in addition to blen and burst type, the SPLIT module need to split this request base on the signal tagctrl_isched_rec.beat_dirty_mask.
+When the bit of the cmu_isched_evict_beat_mask is 0, this beat¡¯s instruction is WB;
+When the bit of the tagctrl_isched_rec.beat_dirty_mask is 1, this beat¡¯s instruction is WB_WR.
+Because when write through request hit the cacheline or sector, this request is not always visit the total cacheline. The beats that are not accessed do not need to perform a merge operation.
+
+Except this instruction, the other request¡¯s instruction need to keep the same as origin after splitting.
+
+
+2. Counter
+A counter is used to count the number of 512-bit request sent.
+?	For every 512-bit request sent to RCTRL, the counter increments by 1.
+?	When counter == blen, the last request is marked, and the request is released.
+
+Write data fetch
+This section handles commands that fetch data from the IWDB, such as WR, WB_WR, and AA. Other requests like RD, WB, and FLUSH can bypass the latency FIFO and do not require this mechanism.
+
+Credit Control
+Background: Since both the WB_WR/AA/WR and WT channels need to fetch data from the IWDB, without proper credit control for the write data requests, downstream backpressure from RCTRL could cause busy on the IWDB read path. This could cause the WT request to be blocked from getting data from the IWDB. If, at this point, the WDC's order FIFO has a WT request in the first position, it may prevent write commands from being released from the FIFO. If the WB and other related requests from RCTRL are not processed, the entire write path could face deadlock.
+?	 
+
+?	Credit: The ISCHED manages a credit counter, with an initial value equal to the depth of its data FIFO. Each time a write data request is issued, the credit counter decreases by one, since the request pulls data from the IWDB into the data FIFO. When the credit counter reaches zero, it means all available space in the data FIFO has been allocated, and no more write data requests can be sent. When data in the FIFO is consumed, the credit counter is incremented.
+
+ 
+
+
+
+
+
+
+
+
+8.5 WDC
+Function description
+Main Functions
+Routing Write Commands and Write Data
+
+Routing Write Commands
+The purpose of write commands is to access the IWDB module for retrieving write data. There are two types of commands that require data from the IWDB:
+?	From ISCHED: WR, WB_WR, and AA command
+?	From TagCtrl: WT, WB, WB_WR, Flush command
+Since the IWDB is pipeline-based and only allows single-channel access, these two types of commands must undergo arbitration before entering the IWDB pipeline. This arbitration process is one of the primary functions of the WDC module.
+
+Routing Write Data
+The destination for write data is the MEM_IF module in TagCtrl, which sends write data to the DDR. There are two types of write data that need to be routed to MEM_IF:
+?	From RCTRL: WB and WB_WR write data
+?	From IWDB: WT write data
+To ensure that write commands and write data are properly aligned, the WDC module uses an order FIFO to store WT, WB, and WB_WR instructions, ensuring their sequence remains consistent.
+Similar to ISCHED, if WT commands are not credit-controlled, it may lead to a system deadlock. To allow WT instructions to access the IWDB, it is essential to ensure there are enough credit counters, with the number of credits matching the FIFO depth.
+In addition, the WDC also needs to split the WT requests into 512-bit aligned requests.
+
+Hardware description
+ 
+
+The two order_fifos are the keys to route the write command and the write data.
+
+
+
+8.5 Memory Scheduler
+ 
+Figure Mem scheduler scheme
+8.5.1 Function Description
+- Select request based on DDR-friendly priority
+- Maintain the original order of request accessing same cacheline.
+
+Bank will issue a lot of PAs to memory scheduler. The PA queue shall record the original order. Memory scheduler tracks the PA of last request issued to DDR. If there is any request that matches the row id and bank id of the last request PA, the matched request has the highest priority to output in PA queue.
+
+Each PA carries a unique buffer index. The buffer index points to the corresponding command location in BANK.
+
+To avoid request staying in the queue for a long time, the oldest request shall be selected in highest priority.
+
+8.5.2 Hardware Description
+A depth 32 buffer is implemented in PA queue.
+ 
+This figure shows how to push request into PA queue and pop request from PA queue when queue depth is 4.
+On cycle 0, req 0 is going to be pushed into PA queue.
+On cycle 1, req 1 is going to be pushed into PA queue.
+On cycle 2, req 2 is going to be pushed into PA queue. At the same time, req 1 is popped out.
+On cycle 3 and cycle 4, req 3 and req 4 are pushed into PA queue.
+The oldest request drops down when request is pushed. 
+?	Input request always flows into entry 3 when there is empty entry in PA queue.
+?	Input request is stalled when there is no space in PA queue.
+?	The request in entry 0 always has the highest priority.
+
+When entry 3 and entry 0 both have valid requests while there is space in PA queue as shown on cycle 4, req 2 and req 3 still drops. On cycle 5, PA queue is full, and stall the input request.
+
+
+
+
+
+
+
+
+
+8.6 Mem_If
+8.6.1 Function Description
+?	memory scheduler
+Memif is responsible to issue address to memory scheduler when memory scheduler function is enabled via memif_mem_sched interface. This interface carries hashed address and request index. The request index is called buffer index. It is a unique id to indicates which location the corresponding sideband information is stored. In memory scheduler, the hashed address is used to decide priority based on LRU algorithm. After selected in memory scheduler, memory scheduler will return buffer index to memif. The pa on interface mem_sched_memif is ignored. The detailed hash function on PA, please refer to section 3.9.
+?	NSP allocation
+Memif provides a unified ID pool for read and write request. Write and read operation can allocate up to 128 IDs. For read operation, it can only be issued when ROB has enough empty space. So even if there is enough ID, but there is no enough empty space in ROB, the read request is only be stalled.
+?	write data and request synchronization
+Based on NSP protocol, write request and write data shall be issued together. So, write request shall wait for write data from IWDB or RCTRL. 
+?	ROB management
+ROB has two function:
+-	All the bypass read request data will be returned to NOC directly without passing through RCTRL.
+-	Avoid backpressure to NSP read response interface.
+Any read request should allocate continuous ROB space first, then allocate NSP id. Sometimes, there is enough space in ROB but the space is not continuous, read request still need to wait for continuous space is freed. 
+Read request allocates ROB space based on at least 512-bit granularity. NSP return 256bit a cycle. Therefore at least 2 cycles, a read request data can be ready. ROB provides 256-bit write port and 512-bit read port. If all data return from NSP, the read requests are arbitrated to access ROB based on round robin algorithm.  
+For bypass read request, the readout data from ROB is issued to ALIGN directly. For linefill data, the readout data from ROB is issued to RCTRL.
+?	Fetch write data from IWDB or RCTRL
+After memory scheduler, if the request is a bypass write request, it must fetch data from IWDB. 
+If the request is WB or FLUSH or WB_WR, it must fetch data from RCTRL.
+?	Resolve linefill and writeback hazard
+If memory scheduler is disabled, the writeback is always first issued to NSP. Therefore, linefill and writeback hazard doesn¡¯t exist.
+If memory scheduler is enabled, the linefill may be issued to NSP prior than writeback. It is possible that the writeback is not issued but the linefill data all return back. If a linefill request is dependent on Writeback, the request is marked as wb_check. When allocate NSP ID, it will check if the corresponding cacheline writeback is finished by lookup pending writeback buffer in TagCtrl. If finished, TagCtrl will issue finished flag back to MEMIF. The wb_check is cleared. If not finished, wb_check still exist in NSP entry. When writeback is finished, RCTRL will broadcast to TagCtrl and Memif, the wb_check in NSP entry is cleared. The linefill request cannot be issued to RCTRL until the wb_check is cleared.
+8.6.2 Hardware Description
+ 
+This figure shows the data path flow in MEMIF. 
+Deadlock concern:
+?	Allocate ROB index is prior than allocate write data sync. If allocate ROB index is later than wdata sync or they happen at the same cycle. The deadlock will happen. The root cause is linefill and writeback share a pipeline in RCTRL. If writeback is stalled, linefill is also stalled. ROB space can¡¯t be freed. The request on the head of latency FIFO will be stalled due to not enough ROB space.
+Wb_check update:
+?	When linefill request allocate NSP ID and check the dependent writeback is not finished, but RCTRL broadcast writeback done at the same time, the wb_check will be cleared. TagCtrl need return wb finish response to MEMIF.
+Address Hazard:
+?	The hazard of address overlap between read request and write request doesn¡¯t exist because MEMIF doesn¡¯t reorder the requests from TagCtrl unless memory scheduler is enabled. When memory scheduler is enabled, memory scheduler will keep the order of same cacheline. That means if two request that access the same cacheline, memory scheduler will output the two request in order. Therefore MEMIF doesn¡¯t need to handle Address Hazard.
+
+
+9 Area
+
+	Sram Area	Register Area	Reserved Area	
+TagCtrl	1.6w	0.4w	0.4w	2.4w
+MEMIF	0.5w	0.2w	0.2w	0.9w
+ISCHED	-	0.5w	0.3w	0.8w
+RCTRL	25.5w	-	1.5w	27w
+WDC,ALIGN,IWDB	-	-	1w	1w
+Sum				32.7w
+
+
+10 Performance
+Case	Latency
+read hit 	11 cycles
+write 	1 cycle after sync write data and write command
+
